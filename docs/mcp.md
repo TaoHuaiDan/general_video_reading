@@ -26,9 +26,11 @@ environment.  The server uses stdio and does not open a network listener.
 ## Tools
 
 - `inspect_video`: read local dimensions, FPS, duration, and codec without OCR.
-- `ocr_video`: start an asynchronous full-video OCR job.
-- `ocr_video_chunked`: split a long video into seekable overlapping windows,
-  process them in parallel, and merge boundary duplicates by time/text/geometry.
+- `ocr_video`: start asynchronous OCR with automatic short-video bypass and
+  long-video chunk planning.
+- `ocr_video_chunked`: expose the same planner while allowing explicit chunk
+  controls; it processes seekable overlapping windows in parallel and merges
+  boundary duplicates by time/text/geometry.
 - `ocr_segment`: start an asynchronous bounded segment job.
 - `benchmark_ocr`: run up to eight configurations and compare throughput.
 - `get_run_status`: poll a job without loading its event list.

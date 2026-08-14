@@ -273,23 +273,55 @@ def ocr_video(
     video: str,
     output_dir: str | None = None,
     config_path: str | None = None,
+    start_sec: float | None = None,
     end_sec: float | None = None,
+    chunk_sec: float | None = None,
+    overlap_sec: float = 4.0,
+    workers: int | None = None,
     sample_fps: float | None = 1.0,
     max_width: int | None = 1280,
     thread_type: str = "AUTO",
+    ocr_threads_per_worker: int | None = None,
+    short_video_threshold_sec: float = 300.0,
 ) -> dict[str, Any]:
-    """Start asynchronous full-video OCR over a local video file."""
-    return _submit_ocr(
-        kind="ocr",
-        video=video,
-        output_dir=output_dir,
-        config_path=config_path,
-        start_sec=None,
-        end_sec=end_sec,
-        sample_fps=sample_fps,
-        max_width=max_width,
-        thread_type=thread_type,
-    )
+    """Start asynchronous OCR with automatic long-video chunk planning."""
+    video_path = _validate_video(video)
+    if start_sec is not None and start_sec < 0:
+        raise ValueError("start_sec must be non-negative")
+    if end_sec is not None and end_sec <= 0:
+        raise ValueError("end_sec must be positive")
+    if chunk_sec is not None and chunk_sec <= 0:
+        raise ValueError("chunk_sec must be positive")
+    if overlap_sec < 0:
+        raise ValueError("overlap_sec must be non-negative")
+    if workers is not None and not 1 <= workers <= 8:
+        raise ValueError("workers must be between 1 and 8")
+    if ocr_threads_per_worker is not None and ocr_threads_per_worker <= 0:
+        raise ValueError("ocr_threads_per_worker must be positive")
+    if short_video_threshold_sec < 0:
+        raise ValueError("short_video_threshold_sec must be non-negative")
+    job_id = f"ocr-auto-{uuid.uuid4().hex[:12]}"
+    target = _JOBS.allocate_output_dir(output_dir, job_id)
+
+    def task() -> dict[str, Any]:
+        execution = run_video_ocr_chunked(
+            video_path,
+            target,
+            config_path=config_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            chunk_sec=chunk_sec,
+            overlap_sec=overlap_sec,
+            workers=workers,
+            sample_fps=sample_fps,
+            max_width=max_width,
+            thread_type=thread_type,
+            ocr_threads_per_worker=ocr_threads_per_worker,
+            short_video_threshold_sec=short_video_threshold_sec,
+        )
+        return _compact_execution(execution)
+
+    return _JOBS.submit_with_id(job_id, "ocr_auto", target, task)
 
 
 @mcp.tool()
