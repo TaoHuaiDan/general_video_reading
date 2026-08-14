@@ -41,11 +41,13 @@ The default OCR request samples at 1 FPS and caps decoded frames at 1280 px.
 Pass `config_path`, `sample_fps`, and `max_width` explicitly for a benchmark.
 The high-speed project config is `benchmarks/config-fast.json`.
 
-For long videos, prefer `ocr_video_chunked` with the default 120-second chunks
-and 4-second overlap. `workers` controls the number of parallel chunks (up to
-8); `ocr_threads_per_worker` controls ONNX Runtime threads inside each worker.
+`ocr_video_chunked` automatically targets roughly 180-second chunks and keeps
+a 4-second overlap. Inputs at or below 300 seconds bypass chunking and use the
+continuous engine; pass `chunk_sec` explicitly when you want to override that
+choice. `workers` controls the number of parallel chunks (up to 8), and
+`ocr_threads_per_worker` controls ONNX Runtime threads inside each worker.
 The engine uses logical PyAV seeks and does not create re-encoded temporary
-videos. Each job writes per-chunk artifacts under `parts/` and a merged
+videos. Each chunked job writes per-chunk artifacts under `parts/` and a merged
 `events.jsonl` at the job root.
 
 ## Artifacts and environment

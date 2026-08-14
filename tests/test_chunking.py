@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from temporal_ocr.chunking import make_chunks, merge_chunk_events
+from temporal_ocr.chunking import choose_chunk_sec, make_chunks, merge_chunk_events
+
+
+def test_choose_chunk_sec_bypasses_short_video_and_balances_long_video() -> None:
+    assert choose_chunk_sec(240.0) is None
+    selected = choose_chunk_sec(717.899)
+    assert selected is not None
+    assert 179.0 < selected < 180.0
+    assert choose_chunk_sec(360.0) == 180.0
 
 
 def _event(

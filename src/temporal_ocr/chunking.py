@@ -10,6 +10,7 @@ can be merged.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections.abc import Iterable
@@ -26,6 +27,8 @@ from temporal_ocr.rapidocr_backend import RapidOCRRuntime
 from temporal_ocr.runner import OCRExecution, run_video_ocr
 
 _FRAME_ID_CHUNK_STRIDE = 10_000_000
+DEFAULT_AUTO_CHUNK_SEC = 180.0
+DEFAULT_SHORT_VIDEO_THRESHOLD_SEC = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,32 @@ def make_chunks(
         index += 1
         core_start = core_end
     return chunks
+
+
+def choose_chunk_sec(
+    duration_sec: float,
+    *,
+    ideal_chunk_sec: float = DEFAULT_AUTO_CHUNK_SEC,
+    short_video_threshold_sec: float = DEFAULT_SHORT_VIDEO_THRESHOLD_SEC,
+) -> float | None:
+    """Choose an automatic chunk width, or bypass chunking for short videos.
+
+    The target width comes from the full-video benchmark on the reference
+    machine: around 180 seconds gives one useful wave of four workers for a
+    roughly twelve-minute input.  Dividing by the rounded chunk count keeps
+    the final tail from becoming an under-utilized second wave on other
+    durations.
+    """
+    if duration_sec <= 0:
+        raise ValueError("duration_sec must be positive")
+    if ideal_chunk_sec <= 0:
+        raise ValueError("ideal_chunk_sec must be positive")
+    if short_video_threshold_sec < 0:
+        raise ValueError("short_video_threshold_sec must be non-negative")
+    if duration_sec <= short_video_threshold_sec:
+        return None
+    chunk_count = max(2, math.ceil(duration_sec / ideal_chunk_sec))
+    return duration_sec / chunk_count
 
 
 def _read_events(path: Path, *, chunk_index: int) -> list[dict[str, Any]]:
@@ -366,15 +395,16 @@ def run_video_ocr_chunked(
     config_path: str | Path | None = None,
     start_sec: float | None = None,
     end_sec: float | None = None,
-    chunk_sec: float = 120.0,
+    chunk_sec: float | None = None,
     overlap_sec: float = 4.0,
     workers: int | None = None,
     sample_fps: float | None = 1.0,
     max_width: int | None = 1280,
     thread_type: str = "AUTO",
     ocr_threads_per_worker: int | None = None,
+    short_video_threshold_sec: float = DEFAULT_SHORT_VIDEO_THRESHOLD_SEC,
 ) -> OCRExecution:
-    """Run independent seekable chunks in parallel and merge their events."""
+    """Run automatic or explicit seekable chunks and merge their events."""
     video_path = Path(video).expanduser().resolve()
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
@@ -383,9 +413,46 @@ def run_video_ocr_chunked(
     requested_end = duration if end_sec is None else min(float(end_sec), duration)
     if requested_start < 0 or requested_end <= requested_start:
         raise ValueError("require 0 <= start_sec < end_sec within video duration")
+    if overlap_sec < 0:
+        raise ValueError("overlap_sec must be non-negative")
+    requested_duration = requested_end - requested_start
+    automatic_chunking = chunk_sec is None
+    effective_chunk_sec = (
+        choose_chunk_sec(
+            requested_duration,
+            short_video_threshold_sec=short_video_threshold_sec,
+        )
+        if automatic_chunking
+        else chunk_sec
+    )
+    if effective_chunk_sec is None:
+        target_dir = Path(output_dir).expanduser().resolve()
+        execution = run_video_ocr(
+            video_path,
+            target_dir,
+            config_path=config_path,
+            start_sec=requested_start,
+            end_sec=requested_end,
+            sample_fps=sample_fps,
+            max_width=max_width,
+            thread_type=thread_type,
+        )
+        metadata = json.loads(execution.metadata_path.read_text(encoding="utf-8"))
+        metadata["mode"] = "auto_continuous"
+        metadata["chunking"] = {
+            "strategy": "short_video_bypass",
+            "requested_chunk_sec": None,
+            "effective_chunk_sec": None,
+            "short_video_threshold_sec": short_video_threshold_sec,
+            "chunk_count": 1,
+        }
+        write_run_metadata(execution.metadata_path, metadata)
+        return execution
+    if overlap_sec >= effective_chunk_sec / 2.0:
+        raise ValueError("overlap_sec must be less than half of the effective chunk width")
     chunk_list = make_chunks(
         requested_end,
-        chunk_sec=chunk_sec,
+        chunk_sec=effective_chunk_sec,
         overlap_sec=overlap_sec,
         start_sec=requested_start,
     )
@@ -496,11 +563,14 @@ def run_video_ocr_chunked(
             "thread_type": thread_type,
         },
         "chunking": {
-            "chunk_sec": chunk_sec,
+            "strategy": "automatic" if automatic_chunking else "explicit",
+            "requested_chunk_sec": chunk_sec,
+            "effective_chunk_sec": effective_chunk_sec,
             "overlap_sec": overlap_sec,
             "chunk_count": len(chunk_list),
             "workers": worker_count,
             "ocr_threads_per_worker": effective_ocr_threads,
+            "short_video_threshold_sec": short_video_threshold_sec,
             "parts_dir": str(parts_dir),
             "parts": chunk_details,
         },
