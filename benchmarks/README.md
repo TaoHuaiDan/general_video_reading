@@ -41,6 +41,9 @@ Results must compare quality and speed together. A throughput-only table is not 
 ## 已验证的真实输入
 
 `BV1hGGV6REWk-full-final` 是一段 850 秒、2560×1600、约 120 FPS 的视觉小说视频，使用
-1 FPS 采样和 1280 最大宽度。最终运行画像：约 300 秒墙钟时间、`2.83× realtime`、845
-个采样帧、299 个输出事件、309 个 OCR 任务。该结果是工程基线，不是带标注数据集的
-准确率结论；建立 reference.jsonl 后才能计算 Event Recall 和 Text Accuracy。
+1 FPS 采样和 1280 最大宽度。旧基线
+`BV1hGGV6REWk-full-final`：约 300 秒墙钟时间、`2.83× realtime`、845 个采样帧、299 个
+输出事件、309 个 OCR 任务。启用轨迹引导 LOCAL 的 `BV1hGGV6REWk-full-guided`：约 185 秒、
+`4.59× realtime`、367 个输出事件、404 个 OCR 任务，检测阶段从约 120 秒降到约 41 秒，
+LOCAL 模型调用从 334 次降到 23 次。两者都只是工程对照，不是带标注数据集的准确率结论；
+建立 `reference.jsonl` 后才能计算 Event Recall 和 Text Accuracy。

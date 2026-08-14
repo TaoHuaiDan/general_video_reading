@@ -24,6 +24,7 @@ from temporal_ocr.geometry import (
     polygon_intersection_over_smaller,
     polygon_iou,
     to_gray,
+    transform_polygon,
 )
 from temporal_ocr.motion import GlobalMotionEstimator, identity_motion
 from temporal_ocr.policy import RuleBasedPolicyScheduler
@@ -158,6 +159,55 @@ class TemporalOCREngine:
                 for item in observations
             )
         )
+
+    def _tracked_local_observations(
+        self,
+        frame: FramePacket,
+        request: DetectionRequest,
+        *,
+        motion: Any,
+    ) -> list[DetectionObservation]:
+        """Project active geometry tracks into a changed local scope.
+
+        Local change detection is commonly caused by new pixels inside an
+        already-known subtitle box. Re-running a neural detector for that box
+        is redundant: the geometry can be propagated with the global motion
+        estimate and the current crop still goes through content tracking and
+        OCR. Periodic full-frame passes remain the discovery safety net for
+        genuinely new text regions.
+        """
+        config = self.config.detection
+        if not config.track_guided_local or not request.scopes:
+            return []
+        observations: list[DetectionObservation] = []
+        height, width = np.asarray(frame.image).shape[:2]
+        diagonal = max(float(np.hypot(width, height)), 1.0)
+        for track in self.geometry.tracks.values():
+            if not track.samples or track.state.value == "ended":
+                continue
+            if track.tracking_confidence < config.track_guided_min_confidence:
+                continue
+            if float(np.hypot(*track.velocity)) / diagonal > config.track_guided_max_velocity_ratio:
+                continue
+            polygon = track.latest.polygon
+            if getattr(motion, "valid", False):
+                polygon = transform_polygon(polygon, np.asarray(motion.matrix))
+            if not any(
+                polygon_coverage(polygon, scope) >= 0.55
+                or polygon_coverage(scope, polygon) >= 0.55
+                for scope in request.scopes
+            ):
+                continue
+            observations.append(
+                DetectionObservation(
+                    frame_id=frame.frame_id,
+                    timestamp=frame.timestamp,
+                    polygon=polygon,
+                    confidence=track.tracking_confidence,
+                    tier=DetectionTier.LOCAL,
+                )
+            )
+        return observations
 
     def _enqueue_content(
         self,
@@ -375,6 +425,14 @@ class TemporalOCREngine:
                     if request.tier == DetectionTier.FAST:
                         profiler.profile.detection_requests_fast += 1
                     elif request.tier == DetectionTier.LOCAL:
+                        guided = self._tracked_local_observations(
+                            frame,
+                            request,
+                            motion=motion,
+                        )
+                        if guided:
+                            observations.extend(guided)
+                            profiler.count("track_guided_local_observations", len(guided))
                         uncovered = self._uncovered_scopes(request.scopes, observations)
                         if not uncovered:
                             continue

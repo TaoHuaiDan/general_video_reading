@@ -76,6 +76,13 @@ frames update active event extent without invoking detection, small changes use 
 changes or audits use FAST/AUDIT. Typewriter intermediate states can be deferred from OCR until a
 stable or final state is available.
 
+When a LOCAL scope is already covered by a high-confidence geometry track, the engine projects the
+track polygon with the current global motion estimate and feeds the current crop directly to
+content tracking. This removes a redundant detector invocation while preserving periodic
+full-frame discovery. Tracks with excessive independent velocity are excluded from this shortcut
+and fall back to LOCAL detection, so scrolling or independently moving text does not silently
+inherit a stale box. `detection.track_guided_local` is an explicit ablation switch.
+
 ## Policy scheduler
 
 The scheduler consumes continuous runtime signals rather than a video-type label. Initial rules

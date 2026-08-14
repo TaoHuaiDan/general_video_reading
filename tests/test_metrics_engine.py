@@ -8,8 +8,10 @@ from temporal_ocr.engine import TemporalOCREngine
 from temporal_ocr.metrics import evaluate_events
 from temporal_ocr.types import (
     DetectionObservation,
+    DetectionRequest,
     DetectionTier,
     FramePacket,
+    MotionEstimate,
     OCRResult,
     TextEvent,
 )
@@ -210,3 +212,34 @@ def test_fast_detection_prevents_redundant_local_detection() -> None:
 
     encompassing = ((0.0, 0.0), (220.0, 0.0), (220.0, 60.0), (0.0, 60.0))
     assert TemporalOCREngine._uncovered_scopes((encompassing,), [line]) == ()
+
+
+def test_tracked_geometry_can_cover_a_local_change_without_model_detection() -> None:
+    engine = TemporalOCREngine(
+        CallableDetector(lambda _frame, _request: [], name="fake-detector"),
+        CallableRecognizer(lambda _tasks: [], name="fake"),
+    )
+    seed = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=POLYGON,
+        confidence=0.9,
+        tier=DetectionTier.AUDIT,
+    )
+    engine.geometry.update([seed], frame_size=(320, 180))
+    request = DetectionRequest(
+        tier=DetectionTier.LOCAL,
+        reason="changed",
+        target_width=1600,
+        scopes=(POLYGON,),
+    )
+
+    projected = engine._tracked_local_observations(
+        FramePacket(1, 1.0, np.zeros((180, 320, 3), dtype=np.uint8)),
+        request,
+        motion=MotionEstimate(np.eye(3), valid=True, confidence=0.9),
+    )
+
+    assert len(projected) == 1
+    assert projected[0].polygon == POLYGON
+    assert projected[0].tier == DetectionTier.LOCAL

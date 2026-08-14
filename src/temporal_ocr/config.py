@@ -31,6 +31,13 @@ class DetectionConfig:
     # A small local change can be handled by LOCAL detection when geometry
     # tracks already exist. FAST is reserved for bootstrap and broad changes.
     fast_trigger_change_ratio: float = 0.12
+    # Reuse a tracked quadrilateral for a local change before invoking the
+    # detector again. Periodic AUDIT/FAST passes still discover new geometry.
+    track_guided_local: bool = True
+    track_guided_min_confidence: float = 0.45
+    # Independently moving text must fall back to LOCAL detection; velocity is
+    # normalized by the current frame diagonal.
+    track_guided_max_velocity_ratio: float = 0.03
     scene_change_score_threshold: float = 0.085
     scene_change_ratio_threshold: float = 0.60
 

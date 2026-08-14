@@ -15,6 +15,8 @@
 - 质量与信息互补性兼顾的候选帧选择。
 - 快速、局部高分辨率、完整审计三级检测请求。
 - FAST 已覆盖区域会跳过 LOCAL；相邻变化瓦片先合并，避免逐瓦片调用模型。
+- 已有高置信度文字轨迹覆盖的 LOCAL 区域直接复用投影四边形，独立运动超过阈值时
+  自动退回检测；周期性 AUDIT/FAST 仍负责发现新文字。
 - 基于运行时统计的规则式策略调度器。
 - Event Recall、Text Accuracy、Duplicate Rate、时空 IoU、吞吐和延迟指标。
 - 可替换的视频源、检测器和 OCR 后端接口。
@@ -70,6 +72,8 @@ recognizer 使用 RapidOCR 内部的批量文字识别接口。低置信度任�
 ## 真实视频速度基准
 
 对一段 850 秒、2560×1600、约 120 FPS 的视觉小说视频，使用 `--sample-fps 1 --max-width 1280`
-完整处理耗时约 300 秒，即 `2.83× realtime`。当前画像中检测耗时约 120 秒，OCR 推理约
-17 秒；其余时间主要是视频解码、候选管理和模型运行时开销。结果保存在
-`benchmarks/output/BV1hGGV6REWk-full-final/`。
+完整处理的旧基线约 300 秒（`2.83× realtime`），检测约 120 秒。启用轨迹引导 LOCAL 后，
+完整运行约 185 秒（`4.59× realtime`），检测约 41 秒；模型 LOCAL 调用从 334 次降到 23 次，
+输出事件从 299 增至 367（仍需带标注集确认 Event Recall/Text Accuracy）。结果分别保存在
+`benchmarks/output/BV1hGGV6REWk-full-final/` 和 `benchmarks/output/BV1hGGV6REWk-full-guided/`。
+如需做消融对照，可在配置文件中设置 `detection.track_guided_local=false`。
