@@ -27,6 +27,8 @@ environment.  The server uses stdio and does not open a network listener.
 
 - `inspect_video`: read local dimensions, FPS, duration, and codec without OCR.
 - `ocr_video`: start an asynchronous full-video OCR job.
+- `ocr_video_chunked`: split a long video into seekable overlapping windows,
+  process them in parallel, and merge boundary duplicates by time/text/geometry.
 - `ocr_segment`: start an asynchronous bounded segment job.
 - `benchmark_ocr`: run up to eight configurations and compare throughput.
 - `get_run_status`: poll a job without loading its event list.
@@ -38,6 +40,13 @@ environment.  The server uses stdio and does not open a network listener.
 The default OCR request samples at 1 FPS and caps decoded frames at 1280 px.
 Pass `config_path`, `sample_fps`, and `max_width` explicitly for a benchmark.
 The high-speed project config is `benchmarks/config-fast.json`.
+
+For long videos, prefer `ocr_video_chunked` with the default 120-second chunks
+and 4-second overlap. `workers` controls the number of parallel chunks (up to
+8); `ocr_threads_per_worker` controls ONNX Runtime threads inside each worker.
+The engine uses logical PyAV seeks and does not create re-encoded temporary
+videos. Each job writes per-chunk artifacts under `parts/` and a merged
+`events.jsonl` at the job root.
 
 ## Artifacts and environment
 
@@ -51,4 +60,3 @@ The MCP returns compact summaries and absolute artifact paths rather than
 embedding the complete event stream in the conversation.  Use
 `get_run_result(include_events=true, max_events=N)` only when event details are
 needed.
-

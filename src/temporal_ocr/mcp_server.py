@@ -25,6 +25,7 @@ from typing import Any
 import cv2
 from mcp.server.fastmcp import FastMCP
 
+from temporal_ocr.chunking import run_video_ocr_chunked
 from temporal_ocr.runner import OCRExecution, run_video_ocr
 
 
@@ -289,6 +290,58 @@ def ocr_video(
         max_width=max_width,
         thread_type=thread_type,
     )
+
+
+@mcp.tool()
+def ocr_video_chunked(
+    video: str,
+    output_dir: str | None = None,
+    config_path: str | None = None,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+    chunk_sec: float = 120.0,
+    overlap_sec: float = 4.0,
+    workers: int | None = None,
+    sample_fps: float | None = 1.0,
+    max_width: int | None = 1280,
+    thread_type: str = "AUTO",
+    ocr_threads_per_worker: int | None = None,
+) -> dict[str, Any]:
+    """Start parallel overlapping-chunk OCR over a local video file."""
+    video_path = _validate_video(video)
+    if start_sec is not None and start_sec < 0:
+        raise ValueError("start_sec must be non-negative")
+    if end_sec is not None and end_sec <= 0:
+        raise ValueError("end_sec must be positive")
+    if chunk_sec <= 0:
+        raise ValueError("chunk_sec must be positive")
+    if overlap_sec < 0 or overlap_sec >= chunk_sec / 2.0:
+        raise ValueError("overlap_sec must be >= 0 and less than half of chunk_sec")
+    if workers is not None and not 1 <= workers <= 8:
+        raise ValueError("workers must be between 1 and 8")
+    if ocr_threads_per_worker is not None and ocr_threads_per_worker <= 0:
+        raise ValueError("ocr_threads_per_worker must be positive")
+    job_id = f"ocr-chunked-{uuid.uuid4().hex[:12]}"
+    target = _JOBS.allocate_output_dir(output_dir, job_id)
+
+    def task() -> dict[str, Any]:
+        execution = run_video_ocr_chunked(
+            video_path,
+            target,
+            config_path=config_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            chunk_sec=chunk_sec,
+            overlap_sec=overlap_sec,
+            workers=workers,
+            sample_fps=sample_fps,
+            max_width=max_width,
+            thread_type=thread_type,
+            ocr_threads_per_worker=ocr_threads_per_worker,
+        )
+        return _compact_execution(execution)
+
+    return _JOBS.submit_with_id(job_id, "ocr_chunked", target, task)
 
 
 @mcp.tool()

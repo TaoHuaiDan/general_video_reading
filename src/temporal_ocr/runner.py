@@ -61,6 +61,10 @@ def run_video_ocr(
     sample_fps: float | None = None,
     max_width: int | None = None,
     thread_type: str = "AUTO",
+    frame_id_offset: int = 0,
+    runtime: RapidOCRRuntime | None = None,
+    intra_op_num_threads: int | None = None,
+    inter_op_num_threads: int | None = None,
 ) -> OCRExecution:
     """Run the existing engine and write its stable JSONL/JSON artifacts."""
     video_path = Path(video).expanduser().resolve()
@@ -72,6 +76,12 @@ def run_video_ocr(
         raise ValueError("end_sec must be non-negative")
     if start_sec is not None and end_sec is not None and start_sec > end_sec:
         raise ValueError("start_sec must not be greater than end_sec")
+    if frame_id_offset < 0:
+        raise ValueError("frame_id_offset must be non-negative")
+    if intra_op_num_threads is not None and intra_op_num_threads <= 0:
+        raise ValueError("intra_op_num_threads must be positive")
+    if inter_op_num_threads is not None and inter_op_num_threads <= 0:
+        raise ValueError("inter_op_num_threads must be positive")
 
     config = EngineConfig.load(config_path) if config_path else EngineConfig()
     source = PyAVFrameSource(
@@ -79,14 +89,26 @@ def run_video_ocr(
         thread_type=thread_type,
         sample_fps=sample_fps,
         max_width=max_width,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        frame_id_offset=frame_id_offset,
     )
     frames = _take_time_range(source, start_sec=start_sec, end_sec=end_sec)
-    runtime = RapidOCRRuntime(
-        params={
-            "EngineConfig.onnxruntime.intra_op_num_threads": config.ocr.intra_op_num_threads,
-            "EngineConfig.onnxruntime.inter_op_num_threads": config.ocr.inter_op_num_threads,
-        }
-    )
+    if runtime is None:
+        runtime = RapidOCRRuntime(
+            params={
+                "EngineConfig.onnxruntime.intra_op_num_threads": (
+                    intra_op_num_threads
+                    if intra_op_num_threads is not None
+                    else config.ocr.intra_op_num_threads
+                ),
+                "EngineConfig.onnxruntime.inter_op_num_threads": (
+                    inter_op_num_threads
+                    if inter_op_num_threads is not None
+                    else config.ocr.inter_op_num_threads
+                ),
+            }
+        )
     engine = TemporalOCREngine(
         RapidOCRDetector(runtime=runtime),
         RapidOCRBatchRecognizer(runtime=runtime),
@@ -107,6 +129,9 @@ def run_video_ocr(
         "sample_fps": sample_fps,
         "max_width": max_width,
         "thread_type": thread_type,
+        "frame_id_offset": frame_id_offset,
+        "intra_op_num_threads": intra_op_num_threads,
+        "inter_op_num_threads": inter_op_num_threads,
     }
     metadata["artifacts"] = {
         "events": str(events_path),
