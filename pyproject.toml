@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "temporal-ocr-engine"
+version = "0.1.0"
+description = "A benchmark-first temporal OCR engine for complete video text extraction."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+]
+
+[project.optional-dependencies]
+video = ["av>=14"]
+ocr = ["rapidocr>=3", "onnxruntime>=1.18"]
+dev = ["pytest>=8", "ruff>=0.7", "pyright>=1.1"]
+
+[project.scripts]
+temporal-ocr = "temporal_ocr.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/temporal_ocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
