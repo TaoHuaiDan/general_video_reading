@@ -99,6 +99,7 @@ class TemporalOCREngine:
         self._cached_content_ids: set[int] = set()
         self._queued_content_ids: set[int] = set()
         self._results: dict[int, OCRResult] = {}
+        self._geometry_refresh_cooldown_until: dict[int, float] = {}
 
     @staticmethod
     def _merge_observations(
@@ -166,7 +167,8 @@ class TemporalOCREngine:
         request: DetectionRequest,
         *,
         motion: Any,
-    ) -> list[DetectionObservation]:
+        pixel_delta: np.ndarray | None = None,
+    ) -> tuple[list[DetectionObservation], tuple[Polygon, ...], tuple[int, ...]]:
         """Project active geometry tracks into a changed local scope.
 
         Local change detection is commonly caused by new pixels inside an
@@ -178,8 +180,10 @@ class TemporalOCREngine:
         """
         config = self.config.detection
         if not config.track_guided_local or not request.scopes:
-            return []
+            return [], (), ()
         observations: list[DetectionObservation] = []
+        overflow_scopes: list[Polygon] = []
+        overflow_geometry_ids: list[int] = []
         height, width = np.asarray(frame.image).shape[:2]
         diagonal = max(float(np.hypot(width, height)), 1.0)
         for track in self.geometry.tracks.values():
@@ -192,11 +196,37 @@ class TemporalOCREngine:
             polygon = track.latest.polygon
             if getattr(motion, "valid", False):
                 polygon = transform_polygon(polygon, np.asarray(motion.matrix))
-            if not any(
-                polygon_coverage(polygon, scope) >= 0.55
-                or polygon_coverage(scope, polygon) >= 0.55
+            matching_scopes = tuple(
+                scope
                 for scope in request.scopes
-            ):
+                if polygon_coverage(polygon, scope) >= 0.55
+                or polygon_coverage(scope, polygon) >= 0.55
+            )
+            if not matching_scopes:
+                continue
+            refresh_confident = track.tracking_confidence >= 0.60
+            force_local_refresh = request.reason == "urgent_local_change" and refresh_confident
+            refresh_allowed = frame.timestamp >= self._geometry_refresh_cooldown_until.get(
+                track.geometry_id,
+                float("-inf"),
+            )
+            geometry_scope_refresh = refresh_allowed and self._scope_geometry_refresh(
+                polygon,
+                matching_scopes,
+                tracking_confidence=track.tracking_confidence,
+            )
+            if refresh_allowed and (force_local_refresh or geometry_scope_refresh or (
+                pixel_delta is not None
+                and refresh_confident
+                and self._has_track_overflow(
+                    polygon,
+                    pixel_delta,
+                )
+            )):
+                overflow_geometry_ids.append(track.geometry_id)
+                overflow_scopes.extend(
+                    self._expanded_overflow_scopes(polygon, matching_scopes)
+                )
                 continue
             observations.append(
                 DetectionObservation(
@@ -207,7 +237,118 @@ class TemporalOCREngine:
                     tier=DetectionTier.LOCAL,
                 )
             )
-        return observations
+        return observations, tuple(overflow_scopes), tuple(overflow_geometry_ids)
+
+    def _has_track_overflow(
+        self,
+        polygon: Polygon,
+        pixel_delta: np.ndarray,
+    ) -> bool:
+        """Detect changed pixels just outside a projected text quadrilateral."""
+        config = self.config.detection
+        x1, y1, x2, y2 = polygon_bbox(polygon)
+        box_width = max(2.0, x2 - x1)
+        box_height = max(2.0, y2 - y1)
+        padding_x = max(6.0, box_width * 0.35)
+        padding_y = max(8.0, box_height * config.track_guided_overflow_padding_ratio)
+        image_height, image_width = pixel_delta.shape[:2]
+
+        def bounds(left: float, top: float, right: float, bottom: float) -> tuple[int, int, int, int]:
+            return (
+                max(0, min(image_width - 1, int(np.floor(left)))),
+                max(0, min(image_height - 1, int(np.floor(top)))),
+                max(1, min(image_width, int(np.ceil(right)))),
+                max(1, min(image_height, int(np.ceil(bottom)))),
+            )
+
+        inner_left, inner_top, inner_right, inner_bottom = bounds(x1, y1, x2, y2)
+        outer_left, outer_top, outer_right, outer_bottom = bounds(
+            x1 - padding_x,
+            y1 - padding_y,
+            x2 + padding_x,
+            y2 + padding_y,
+        )
+        threshold = config.track_guided_pixel_change_threshold
+        vertical_parts = (
+            pixel_delta[outer_top:inner_top, outer_left:outer_right],
+            pixel_delta[inner_bottom:outer_bottom, outer_left:outer_right],
+        )
+        horizontal_parts = (
+            pixel_delta[inner_top:inner_bottom, outer_left:inner_left],
+            pixel_delta[inner_top:inner_bottom, inner_right:outer_right],
+        )
+
+        def changed_ratio(parts: tuple[np.ndarray, ...]) -> float:
+            area = sum(part.size for part in parts)
+            if area <= 0:
+                return 0.0
+            changed = sum(np.count_nonzero(part >= threshold) for part in parts)
+            return float(changed) / area
+
+        return max(changed_ratio(vertical_parts), changed_ratio(horizontal_parts)) >= (
+            config.track_guided_overflow_ratio
+        )
+
+    @staticmethod
+    def _scope_geometry_refresh(
+        polygon: Polygon,
+        scopes: tuple[Polygon, ...],
+        *,
+        tracking_confidence: float,
+    ) -> bool:
+        """Refresh a high-confidence line when its change scope can hold wraps."""
+        if tracking_confidence < 0.60:
+            return False
+        x1, y1, x2, y2 = polygon_bbox(polygon)
+        box_width = max(2.0, x2 - x1)
+        box_height = max(2.0, y2 - y1)
+        if box_height < 16.0:
+            return False
+        for scope in scopes:
+            sx1, sy1, sx2, sy2 = polygon_bbox(scope)
+            if (
+                sx2 - sx1 >= 2.0 * box_width
+                and sy2 - sy1 >= 4.0 * box_height
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _expanded_overflow_scopes(
+        polygon: Polygon,
+        scopes: tuple[Polygon, ...],
+    ) -> tuple[Polygon, ...]:
+        """Make a local refresh wide/tall enough to recover wrapped dialogue."""
+        x1, y1, x2, y2 = polygon_bbox(polygon)
+        box_width = max(2.0, x2 - x1)
+        box_height = max(2.0, y2 - y1)
+        # The tracked box can be only one line of a wrapped dialogue.  Keep
+        # the changed local component as the horizontal/vertical envelope so
+        # the refresh can discover sibling lines, but still issue one model
+        # call instead of detecting the original and expanded scopes twice.
+        scope_boxes = [polygon_bbox(scope) for scope in scopes]
+        if scope_boxes:
+            scope_x1 = min(item[0] for item in scope_boxes)
+            scope_y1 = min(item[1] for item in scope_boxes)
+            scope_x2 = max(item[2] for item in scope_boxes)
+            scope_y2 = max(item[3] for item in scope_boxes)
+        else:
+            scope_x1, scope_y1, scope_x2, scope_y2 = x1, y1, x2, y2
+        expanded = (
+            min(x1 - 0.6 * box_width, scope_x1),
+            min(y1 - 2.0 * box_height, scope_y1),
+            max(x2 + 0.6 * box_width, scope_x2),
+            max(y2 + 2.0 * box_height, scope_y2),
+        )
+        left, top, right, bottom = expanded
+        return (
+            (
+                (left, top),
+                (right, top),
+                (right, bottom),
+                (left, bottom),
+            ),
+        )
 
     def _enqueue_content(
         self,
@@ -420,20 +561,43 @@ class TemporalOCREngine:
                 motion_reliable=motion_reliable,
             )
             observations: list[DetectionObservation] = []
+            overflow_scopes: list[Polygon] = []
+            overflow_geometry_ids: list[int] = []
             with profiler.stage("text_detection"):
                 for request in requests:
                     if request.tier == DetectionTier.FAST:
                         profiler.profile.detection_requests_fast += 1
                     elif request.tier == DetectionTier.LOCAL:
-                        guided = self._tracked_local_observations(
+                        if request.reason == "urgent_local_change":
+                            profiler.count("urgent_local_requests")
+                        guided, request_overflow, request_overflow_ids = (
+                            self._tracked_local_observations(
                             frame,
                             request,
                             motion=motion,
+                            pixel_delta=change.pixel_delta,
+                            )
                         )
                         if guided:
                             observations.extend(guided)
                             profiler.count("track_guided_local_observations", len(guided))
+                        overflow_scopes.extend(request_overflow)
+                        overflow_geometry_ids.extend(request_overflow_ids)
                         uncovered = self._uncovered_scopes(request.scopes, observations)
+                        if request_overflow:
+                            # An overflow refresh is a replacement for the original
+                            # local scope.  Keeping both would invoke RapidOCR twice
+                            # on overlapping crops and erase the speed benefit.
+                            uncovered = tuple(
+                                scope
+                                for scope in uncovered
+                                if not any(
+                                    polygon_coverage(scope, refresh) >= 0.55
+                                    or polygon_coverage(refresh, scope) >= 0.55
+                                    for refresh in request_overflow
+                                )
+                            )
+                            uncovered += tuple(request_overflow)
                         if not uncovered:
                             continue
                         profiler.profile.detection_requests_local += 1
@@ -451,11 +615,40 @@ class TemporalOCREngine:
             profiler.profile.frames_probed += int(bool(requests))
 
             if requests:
+                overflow_ids = set(overflow_geometry_ids)
+                for geometry_id in self.geometry.end_ids(tuple(overflow_ids)):
+                    finalized = self.content.finalize_geometry(geometry_id)
+                    if finalized is not None:
+                        if (
+                            geometry_id in overflow_ids
+                            and finalized.recognized_text is None
+                            and finalized.stable_observations
+                            < self.config.content.stable_observations
+                        ):
+                            profiler.count("ocr_deferred_geometry_refresh")
+                            continue
+                        self._enqueue_content(finalized, profiler, force=True)
                 geometry_update = self.geometry.update(
                     observations,
                     motion=motion,
                     frame_size=(image.shape[1], image.shape[0]),
                 )
+                if overflow_ids and geometry_update.assignments:
+                    cooldown_until = frame.timestamp + max(
+                        2.25,
+                        self.config.content.maximum_wait_sec + 0.45,
+                    )
+                    for geometry_id, assigned in geometry_update.assignments.items():
+                        if (
+                            geometry_id not in geometry_update.created
+                            and not any(
+                                polygon_coverage(assigned.polygon, scope) >= 0.55
+                                or polygon_coverage(scope, assigned.polygon) >= 0.55
+                                for scope in overflow_scopes
+                            )
+                        ):
+                            continue
+                        self._geometry_refresh_cooldown_until[geometry_id] = cooldown_until
                 profiler.profile.geometry_tracks_created += len(geometry_update.created)
                 signals.track_birth_rate = 0.8 * signals.track_birth_rate + 0.2 * len(
                     geometry_update.created

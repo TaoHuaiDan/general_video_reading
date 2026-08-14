@@ -38,6 +38,12 @@ class DetectionConfig:
     # Independently moving text must fall back to LOCAL detection; velocity is
     # normalized by the current frame diagonal.
     track_guided_max_velocity_ratio: float = 0.03
+    # If changed pixels spill outside a tracked box, refresh its geometry with
+    # LOCAL detection instead of reusing a stale one-line box for multi-line
+    # dialogue. The pixel threshold is applied to the compensated delta map.
+    track_guided_pixel_change_threshold: float = 0.08
+    track_guided_overflow_ratio: float = 0.025
+    track_guided_overflow_padding_ratio: float = 1.0
     scene_change_score_threshold: float = 0.085
     scene_change_ratio_threshold: float = 0.60
 

@@ -49,6 +49,24 @@ class HierarchicalDetectionPlanner:
             return requests
 
         if timestamp - self.last_probe < decision.probe_interval_sec:
+            # A typewriter or wrapped-dialogue update can arrive during the
+            # normal probe cooldown.  Let the local path inspect it when
+            # geometry already exists, while leaving broad changes to the
+            # regular FAST/audit schedule.
+            if (
+                changed_scopes
+                and has_active_tracks
+                and changed_ratio < self.config.fast_trigger_change_ratio
+                and decision.enable_local_detection
+            ):
+                return [
+                    DetectionRequest(
+                        tier=DetectionTier.LOCAL,
+                        reason="urgent_local_change",
+                        target_width=self.config.local_width,
+                        scopes=changed_scopes,
+                    )
+                ]
             return requests
         self.last_probe = timestamp
         # Once geometry tracks exist, a small changed region is cheaper and

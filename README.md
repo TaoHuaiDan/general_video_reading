@@ -77,3 +77,14 @@ recognizer 使用 RapidOCR 内部的批量文字识别接口。低置信度任�
 输出事件从 299 增至 367（仍需带标注集确认 Event Recall/Text Accuracy）。结果分别保存在
 `benchmarks/output/BV1hGGV6REWk-full-final/` 和 `benchmarks/output/BV1hGGV6REWk-full-guided/`。
 如需做消融对照，可在配置文件中设置 `detection.track_guided_local=false`。
+
+轨迹复用不会把“上一帧的一行框”永久当成完整对话框：当补偿后的变化像素溢出高置信度
+轨迹，LOCAL 会刷新其几何范围；刷新后新建或同范围内的轨迹进入短暂冷却，先完成下一次
+稳定观察再允许再次刷新，避免多行对白刚检测出来就被下一帧提前结束。探测冷却期间若已有
+文字轨迹仍发生小范围变化，调度器会发出 `urgent_local_change`，但仍限制在 LOCAL scope，
+不会退回全画面 FAST。
+
+以同一视频前 60 秒、`--sample-fps 1 --max-width 1280` 做回归，当前保护版约 28.0 秒，
+即 `2.12× realtime`；关键 14 秒对白的三行均能输出（`我慢慢走过去，`、`希罗也跟着`、
+`在床边坐下。`）。该结果主要用于完整性回归，尚未替代带人工标注集的 Event Recall/Text
+Accuracy 评测；正式输出见 `benchmarks/output/BV1hGGV6REWk-60s-overflow-v17/`。

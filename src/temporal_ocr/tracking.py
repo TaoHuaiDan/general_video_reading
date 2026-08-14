@@ -127,6 +127,23 @@ class GeometryTracker:
                 ended.append(track.geometry_id)
         return GeometryUpdate(assignments, tuple(created), tuple(ended))
 
+    def end_ids(self, geometry_ids: tuple[int, ...]) -> tuple[int, ...]:
+        """End only tracks whose geometry was proven stale by local overflow."""
+        target_ids = set(geometry_ids)
+        if not target_ids:
+            return ()
+        ended: list[int] = []
+        for track in self.tracks.values():
+            if (
+                track.geometry_id not in target_ids
+                or track.state == GeometryState.ENDED
+                or not track.samples
+            ):
+                continue
+            track.state = GeometryState.ENDED
+            ended.append(track.geometry_id)
+        return tuple(ended)
+
 
 @dataclass(slots=True)
 class ContentUpdate:

@@ -81,7 +81,12 @@ track polygon with the current global motion estimate and feeds the current crop
 content tracking. This removes a redundant detector invocation while preserving periodic
 full-frame discovery. Tracks with excessive independent velocity are excluded from this shortcut
 and fall back to LOCAL detection, so scrolling or independently moving text does not silently
-inherit a stale box. `detection.track_guided_local` is an explicit ablation switch.
+inherit a stale box. When compensated pixels spill outside a tracked line, LOCAL refreshes the
+scope with enough vertical envelope to discover wrapped dialogue lines. The refresh ends only the
+geometry IDs proven stale; newly created tracks and tracks assigned inside the same refresh scope
+are held in a short cooldown so a second frame can stabilize their content before another refresh.
+During probe cooldown, a small changed scope can emit `urgent_local_change`; it remains local and
+does not force a full-frame pass. `detection.track_guided_local` is an explicit ablation switch.
 
 ## Policy scheduler
 

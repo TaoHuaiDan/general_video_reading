@@ -168,6 +168,34 @@ def test_active_tracks_use_local_detection_for_small_changes() -> None:
     assert {item.tier for item in requests} == {DetectionTier.FAST, DetectionTier.LOCAL}
 
 
+def test_active_text_change_interrupts_probe_cooldown() -> None:
+    planner = HierarchicalDetectionPlanner(DetectionConfig(audit_interval_sec=10.0))
+    decision = PolicyDecision(1.25, 10.0, 960, 0.4, 1.5, 8, 30)
+    scope = (((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)),)
+
+    planner.plan(
+        timestamp=0.0,
+        scene_cut=True,
+        changed_scopes=(),
+        changed_ratio=1.0,
+        has_active_tracks=False,
+        decision=decision,
+        motion_reliable=True,
+    )
+    requests = planner.plan(
+        timestamp=1.0,
+        scene_cut=False,
+        changed_scopes=scope,
+        changed_ratio=0.01,
+        has_active_tracks=True,
+        decision=decision,
+        motion_reliable=True,
+    )
+
+    assert [item.tier for item in requests] == [DetectionTier.LOCAL]
+    assert requests[0].reason == "urgent_local_change"
+
+
 def test_motion_unreliable_audit_is_rate_limited() -> None:
     planner = HierarchicalDetectionPlanner(
         DetectionConfig(audit_interval_sec=10.0, min_audit_interval_sec=3.0)

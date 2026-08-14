@@ -132,6 +132,7 @@ def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> 
     config.content.stable_observations = 2
     config.content.change_threshold = 0.01
     config.content.typewriter_skip_score = 0.1
+    config.detection.track_guided_local = False
     engine = TemporalOCREngine(
         CallableDetector(detect, name="fake-detector"),
         CallableRecognizer(recognize, name="fake"),
@@ -234,12 +235,52 @@ def test_tracked_geometry_can_cover_a_local_change_without_model_detection() -> 
         scopes=(POLYGON,),
     )
 
-    projected = engine._tracked_local_observations(
+    projected, overflow, overflow_ids = engine._tracked_local_observations(
         FramePacket(1, 1.0, np.zeros((180, 320, 3), dtype=np.uint8)),
         request,
         motion=MotionEstimate(np.eye(3), valid=True, confidence=0.9),
     )
 
     assert len(projected) == 1
+    assert overflow == ()
+    assert overflow_ids == ()
     assert projected[0].polygon == POLYGON
     assert projected[0].tier == DetectionTier.LOCAL
+
+
+def test_tracked_geometry_requests_refresh_when_pixels_overflow_the_box() -> None:
+    engine = TemporalOCREngine(
+        CallableDetector(lambda _frame, _request: [], name="fake-detector"),
+        CallableRecognizer(lambda _tasks: [], name="fake"),
+    )
+    seed = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=POLYGON,
+        confidence=0.9,
+        tier=DetectionTier.AUDIT,
+    )
+    engine.geometry.update([seed], frame_size=(320, 180))
+    request = DetectionRequest(
+        tier=DetectionTier.LOCAL,
+        reason="changed",
+        target_width=1600,
+        scopes=(POLYGON,),
+    )
+    pixel_delta = np.zeros((180, 320), dtype=np.float32)
+    pixel_delta[50:85, 10:110] = 1.0
+
+    projected, overflow, overflow_ids = engine._tracked_local_observations(
+        FramePacket(1, 1.0, np.zeros((180, 320, 3), dtype=np.uint8)),
+        request,
+        motion=MotionEstimate(np.eye(3), valid=True, confidence=0.9),
+        pixel_delta=pixel_delta,
+    )
+
+    assert projected == []
+    assert len(overflow) == 1
+    assert overflow_ids == (1,)
+    assert overflow[0][0][0] < POLYGON[0][0]
+    assert overflow[0][1][0] > POLYGON[1][0]
+    assert overflow[0][0][1] < POLYGON[0][1]
+    assert overflow[0][2][1] > POLYGON[2][1]

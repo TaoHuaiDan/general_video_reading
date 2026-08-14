@@ -18,6 +18,7 @@ class ChangeMapResult:
     changed_ratio: float
     changed_tiles: tuple[tuple[int, int], ...]
     scopes: tuple[Polygon, ...]
+    pixel_delta: np.ndarray | None = None
 
 
 class TileChangeDetector:
@@ -92,4 +93,5 @@ class TileChangeDetector:
             changed_ratio=len(changed) / float(self.rows * self.cols),
             changed_tiles=tuple(changed),
             scopes=tuple(scopes),
+            pixel_delta=delta,
         )
