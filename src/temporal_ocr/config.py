@@ -44,6 +44,13 @@ class DetectionConfig:
     track_guided_pixel_change_threshold: float = 0.08
     track_guided_overflow_ratio: float = 0.025
     track_guided_overflow_padding_ratio: float = 1.0
+    # After a geometry refresh, keep propagating the refreshed envelope for a
+    # few seconds.  Text content can change during this window without making
+    # the detector rediscover the same line on every sampled frame.
+    track_guided_refresh_cooldown_sec: float = 5.0
+    # Existing tracks retain a shorter guard so a newly appearing sibling line
+    # can still trigger the first refresh promptly.
+    track_guided_existing_refresh_cooldown_sec: float = 2.25
     scene_change_score_threshold: float = 0.085
     scene_change_ratio_threshold: float = 0.60
 
@@ -81,12 +88,26 @@ class PolicyConfig:
 
 
 @dataclass(slots=True)
+class OCRConfig:
+    """CPU inference settings for the RapidOCR ONNX Runtime backend.
+
+    The default is intentionally conservative for hybrid-core laptop CPUs:
+    one ORT inter-op thread and a bounded intra-op pool avoid the severe
+    oversubscription seen with the runtime's ``-1`` auto setting.
+    """
+
+    intra_op_num_threads: int = 12
+    inter_op_num_threads: int = 1
+
+
+@dataclass(slots=True)
 class EngineConfig:
     motion: MotionConfig = field(default_factory=MotionConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     content: ContentConfig = field(default_factory=ContentConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    ocr: OCRConfig = field(default_factory=OCRConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -105,6 +126,7 @@ class EngineConfig:
             tracking=TrackingConfig(**data.get("tracking", {})),
             content=ContentConfig(**data.get("content", {})),
             policy=PolicyConfig(**data.get("policy", {})),
+            ocr=OCRConfig(**data.get("ocr", {})),
         )
 
     @classmethod

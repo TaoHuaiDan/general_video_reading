@@ -86,7 +86,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_width=args.max_width,
     )
     frames = _take_until_end(source, args.end_sec)
-    runtime = RapidOCRRuntime()
+    runtime = RapidOCRRuntime(
+        params={
+            "EngineConfig.onnxruntime.intra_op_num_threads": config.ocr.intra_op_num_threads,
+            "EngineConfig.onnxruntime.inter_op_num_threads": config.ocr.inter_op_num_threads,
+        }
+    )
     engine = TemporalOCREngine(
         RapidOCRDetector(runtime=runtime),
         RapidOCRBatchRecognizer(runtime=runtime),

@@ -57,10 +57,27 @@ py -3.12 -m venv .venv
 ```
 
 这些输入参数会写入 `run.json`，保证 benchmark 可复现。对远高于采样率的 H.264 视频，
-输入源会自动跳过双向预测帧，减少无效解码；如果需要逐帧保真分析，可以不设置
+输入源会自动跳过非参考帧，减少无效解码；如果需要逐帧保真分析，可以不设置
 `--sample-fps`。
 
 使用 `--end-sec` 做短段 benchmark 时，读取器会在达到终点后立即停止，不会继续扫描整个源视频。
+
+如果目标是视觉小说这类文字尺寸较大、画面布局相对稳定的视频，可以使用仓库附带的高速
+配置。它把 LOCAL/AUDIT 的输入上限分别设为 960/1600，并把运动不可靠时的审计限制在较低
+频率；同时默认给 ONNX Runtime 使用 12 个 intra-op 线程、1 个 inter-op 线程。示例：
+
+```powershell
+.venv\Scripts\python.exe -m temporal_ocr run `
+  benchmarks\input\BV1hGGV6REWk\BV1hGGV6REWk.mp4 `
+  --output benchmarks\output\BV1hGGV6REWk-60s-fast `
+  --config benchmarks\config-fast.json --end-sec 60 `
+  --sample-fps 1 --max-width 1280
+```
+
+在当前 i9-13980HX 上，这条命令对同一视频前 60 秒实测约 10.3 秒，即 `5.74× realtime`；
+14 秒对白的三行（“我慢慢走过去，”“在床边坐下。”“希罗也跟着”）仍全部识别到。该结果是
+工程回归，不等同于带人工标注集的 Event Recall/Text Accuracy；密集小字、滚动字幕或短暂
+弹窗应优先使用默认高分辨率配置，再根据标注结果逐步放宽高速参数。
 
 该基线已经将检测与识别分开：检测器输出四边形，文字框经过透视规范化后，
 recognizer 使用 RapidOCR 内部的批量文字识别接口。低置信度任务才会使用互补候选帧重试。
@@ -84,7 +101,6 @@ recognizer 使用 RapidOCR 内部的批量文字识别接口。低置信度任�
 文字轨迹仍发生小范围变化，调度器会发出 `urgent_local_change`，但仍限制在 LOCAL scope，
 不会退回全画面 FAST。
 
-以同一视频前 60 秒、`--sample-fps 1 --max-width 1280` 做回归，当前保护版约 28.0 秒，
-即 `2.12× realtime`；关键 14 秒对白的三行均能输出（`我慢慢走过去，`、`希罗也跟着`、
-`在床边坐下。`）。该结果主要用于完整性回归，尚未替代带人工标注集的 Event Recall/Text
-Accuracy 评测；正式输出见 `benchmarks/output/BV1hGGV6REWk-60s-overflow-v17/`。
+以同一视频前 60 秒、`--sample-fps 1 --max-width 1280` 的保护版历史回归约 28.0 秒，
+即 `2.12× realtime`；它主要用于检测刷新完整性对照。当前推荐的高速配置见上文，正式结果
+保存在 `benchmarks/output/BV1hGGV6REWk-60s-fast40-w1280-nonref/`。

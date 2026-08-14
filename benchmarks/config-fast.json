@@ -1,0 +1,14 @@
+{
+  "detection": {
+    "fast_width": 640,
+    "local_width": 960,
+    "audit_width": 1600,
+    "audit_interval_sec": 40.0,
+    "max_audit_interval_sec": 40.0,
+    "min_audit_interval_sec": 20.0
+  },
+  "ocr": {
+    "intra_op_num_threads": 12,
+    "inter_op_num_threads": 1
+  }
+}

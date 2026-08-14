@@ -58,12 +58,14 @@ class PyAVFrameSource:
             if self.sample_fps is not None:
                 source_fps = float(stream.average_rate or 0.0)
                 if source_fps > self.sample_fps * 2.0:
-                    # High-FPS screen recordings commonly contain a large B
-                    # frame population. Reference frames retain timestamps and
-                    # are sufficient for low-rate OCR sampling, while decoding
-                    # every B frame wastes most of the wall time before OCR.
+                    # High-FPS screen recordings commonly contain a large
+                    # non-reference frame population. At low OCR sample rates,
+                    # keeping reference frames retains timestamp coverage while
+                    # avoiding most of the decode work before OCR.
                     try:
-                        stream.codec_context.skip_frame = "BIDIR"
+                        stream.codec_context.skip_frame = (
+                            "NONREF" if self.sample_fps <= 1.5 else "BIDIR"
+                        )
                     except (AttributeError, ValueError):
                         pass
             next_sample_timestamp: float | None = None

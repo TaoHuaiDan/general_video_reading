@@ -38,6 +38,12 @@ The first benchmark suite should deliberately include:
 
 Results must compare quality and speed together. A throughput-only table is not sufficient.
 
+## 当前高速回归
+
+`BV1hGGV6REWk-60s-fast40-w1280-nonref` 使用 `--sample-fps 1 --max-width 1280` 和
+`config-fast.json`，在 i9-13980HX 上处理 59.23 秒视频耗时约 10.33 秒（`5.74× realtime`）。
+14 秒对白的三行均被输出；该目录用于速度/完整性回归，不替代带标注数据集的质量评测。
+
 ## 已验证的真实输入
 
 `BV1hGGV6REWk-full-final` 是一段 850 秒、2560×1600、约 120 FPS 的视觉小说视频，使用
