@@ -104,3 +104,16 @@ recognizer 使用 RapidOCR 内部的批量文字识别接口。低置信度任�
 以同一视频前 60 秒、`--sample-fps 1 --max-width 1280` 的保护版历史回归约 28.0 秒，
 即 `2.12× realtime`；它主要用于检测刷新完整性对照。当前推荐的高速配置见上文，正式结果
 保存在 `benchmarks/output/BV1hGGV6REWk-60s-fast40-w1280-nonref/`。
+
+## 本地 OCR MCP
+
+项目还提供一个独立的 stdio MCP 适配层。它只处理已经存在于本地的视频文件；Bilibili
+视频获取、AI 字幕、评论和弹幕仍由独立的 Bilibili MCP 负责，两个服务不互相耦合。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[video,ocr,mcp]"
+.\.venv\Scripts\python.exe -m temporal_ocr.mcp_server
+```
+
+MCP 的详细工具、异步任务和结果文件说明见 `docs/mcp.md`。默认 OCR 任务以 1 FPS、1280 px
+上限运行，并把完整事件写入 `events.jsonl`，对话中只返回摘要和文件路径。

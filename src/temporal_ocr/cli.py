@@ -69,59 +69,20 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    from temporal_ocr.engine import TemporalOCREngine
-    from temporal_ocr.output import write_events, write_run_metadata
-    from temporal_ocr.rapidocr_backend import (
-        RapidOCRBatchRecognizer,
-        RapidOCRDetector,
-        RapidOCRRuntime,
-    )
-    from temporal_ocr.sources import PyAVFrameSource
+    from temporal_ocr.runner import run_video_ocr
 
-    config = EngineConfig.load(args.config) if args.config else EngineConfig()
-    source = PyAVFrameSource(
+    execution = run_video_ocr(
         args.video,
-        thread_type=args.thread_type,
+        args.output,
+        config_path=args.config,
+        end_sec=args.end_sec,
         sample_fps=args.sample_fps,
         max_width=args.max_width,
+        thread_type=args.thread_type,
     )
-    frames = _take_until_end(source, args.end_sec)
-    runtime = RapidOCRRuntime(
-        params={
-            "EngineConfig.onnxruntime.intra_op_num_threads": config.ocr.intra_op_num_threads,
-            "EngineConfig.onnxruntime.inter_op_num_threads": config.ocr.inter_op_num_threads,
-        }
-    )
-    engine = TemporalOCREngine(
-        RapidOCRDetector(runtime=runtime),
-        RapidOCRBatchRecognizer(runtime=runtime),
-        config=config,
-    )
-    result = engine.run(frames)
-    output_dir = Path(args.output).resolve()
-    events_path = write_events(output_dir / "events.jsonl", result.events)
-    metadata = result.to_dict()
-    metadata.pop("events", None)
-    metadata["input"] = {
-        "video": str(Path(args.video).resolve()),
-        "end_sec": args.end_sec,
-        "sample_fps": args.sample_fps,
-        "max_width": args.max_width,
-        "thread_type": args.thread_type,
-    }
-    metadata_path = write_run_metadata(output_dir / "run.json", metadata)
-    print(
-        json.dumps(
-            {
-                "events": str(events_path),
-                "metadata": str(metadata_path),
-                "event_count": len(result.events),
-                "video_realtime": result.profile.video_realtime,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    payload = execution.to_dict()
+    payload.pop("profile", None)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 

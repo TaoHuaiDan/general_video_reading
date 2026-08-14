@@ -17,10 +17,12 @@ dependencies = [
 [project.optional-dependencies]
 video = ["av>=14"]
 ocr = ["rapidocr>=3", "onnxruntime>=1.18"]
+mcp = ["mcp>=1.13,<2"]
 dev = ["pytest>=8", "ruff>=0.7", "pyright>=1.1"]
 
 [project.scripts]
 temporal-ocr = "temporal_ocr.cli:main"
+temporal-ocr-mcp = "temporal_ocr.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/temporal_ocr"]
