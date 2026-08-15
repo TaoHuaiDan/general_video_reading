@@ -11,6 +11,7 @@ artifacts/
 benchmarks/output/
 
 # Local benchmark media and generated OCR deliverables
+benchmarks/input/
 *.mp4
 *.mkv
 *.webm
