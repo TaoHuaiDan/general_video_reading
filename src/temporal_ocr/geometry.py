@@ -3,12 +3,69 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import TypeAlias
 
 import cv2
 import numpy as np
 
 from temporal_ocr.types import Point, Polygon
+
+NormalizedRegion: TypeAlias = tuple[float, float, float, float]
+
+
+def validate_normalized_regions(
+    regions: Iterable[Iterable[float]] | None,
+) -> tuple[tuple[float, float, float, float], ...]:
+    """Validate normalized ``[left, top, right, bottom]`` ignore regions.
+
+    Keeping the public representation normalized makes an MCP request stable
+    across resolutions and across independently decoded chunks.  Internally
+    the engine converts these rectangles to pixel-space quadrilaterals for
+    the current frame.
+    """
+    if regions is None:
+        return ()
+    normalized: list[tuple[float, float, float, float]] = []
+    for index, region in enumerate(regions):
+        values = tuple(float(value) for value in region)
+        if len(values) != 4:
+            raise ValueError(
+                f"exclude_regions[{index}] must contain [left, top, right, bottom]"
+            )
+        left, top, right, bottom = values
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"exclude_regions[{index}] must contain finite numbers")
+        if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+            raise ValueError(
+                f"exclude_regions[{index}] must satisfy 0 <= left < right <= 1 "
+                "and 0 <= top < bottom <= 1"
+            )
+        rectangle = (left, top, right, bottom)
+        if rectangle not in normalized:
+            normalized.append(rectangle)
+    return tuple(normalized)
+
+
+def normalized_region_polygon(
+    region: Sequence[float],
+    width: int,
+    height: int,
+) -> Polygon:
+    """Convert a normalized rectangle to a clamped pixel-space polygon."""
+    if width <= 0 or height <= 0:
+        raise ValueError("frame dimensions must be positive")
+    left, top, right, bottom = (float(value) for value in region)
+    x1 = max(0.0, min(float(width), left * width))
+    y1 = max(0.0, min(float(height), top * height))
+    x2 = max(x1, min(float(width), right * width))
+    y2 = max(y1, min(float(height), bottom * height))
+    return (
+        (x1, y1),
+        (x2, y1),
+        (x2, y2),
+        (x1, y2),
+    )
 
 
 def as_polygon(points: Iterable[Iterable[float]]) -> Polygon:

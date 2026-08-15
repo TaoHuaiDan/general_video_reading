@@ -63,6 +63,9 @@ class DetectionRequest:
     reason: str
     target_width: int
     scopes: tuple[Polygon, ...] = ()
+    # Pixel-space polygons that the detector must ignore for this frame.
+    # The engine populates these from normalized MCP/API regions.
+    exclude_regions: tuple[Polygon, ...] = ()
 
 
 @dataclass(slots=True)
@@ -197,8 +200,10 @@ class RuntimeSignals:
     cache_hit_rate: float = 0.0
     detection_queue_length: int = 0
     ocr_queue_length: int = 0
-    cpu_utilization: float = 0.0
-    gpu_utilization: float = 0.0
+    # ``None`` means no sampler is connected.  A missing GPU sampler must not
+    # be mistaken for an idle GPU and influence batching decisions.
+    cpu_utilization: float | None = None
+    gpu_utilization: float | None = None
 
 
 @dataclass(slots=True)

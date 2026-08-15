@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from temporal_ocr.backends import CallableDetector, CallableRecognizer
+from temporal_ocr.change import TileChangeDetector
 from temporal_ocr.config import EngineConfig
 from temporal_ocr.engine import TemporalOCREngine
 from temporal_ocr.metrics import evaluate_events
@@ -102,6 +103,50 @@ def test_engine_runs_with_pluggable_backends_and_tracks_moving_text() -> None:
     assert len(result.events[0].polygon_history) >= 2
     assert result.profile.ocr_tasks == 1
     assert result.profile.output_events == 1
+
+
+def test_engine_excludes_declared_watermark_region() -> None:
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    watermark = ((150.0, 70.0), (195.0, 70.0), (195.0, 95.0), (150.0, 95.0))
+    real_text = ((10.0, 10.0), (110.0, 10.0), (110.0, 45.0), (10.0, 45.0))
+
+    def detect(frame, request):
+        return [
+            DetectionObservation(frame.frame_id, frame.timestamp, watermark, 0.99, request.tier),
+            DetectionObservation(frame.frame_id, frame.timestamp, real_text, 0.99, request.tier),
+        ]
+
+    def recognize(tasks):
+        return [
+            OCRResult(task.content_id, "dialogue", 0.99, backend="fake")
+            for task in tasks
+        ]
+
+    result = TemporalOCREngine(
+        CallableDetector(detect, name="fake-detector"),
+        CallableRecognizer(recognize, name="fake"),
+        exclude_regions=((0.70, 0.60, 1.0, 1.0),),
+    ).run([FramePacket(0, 0.0, image)])
+
+    assert [item.text_raw for item in result.events] == ["dialogue"]
+    assert result.profile.counters.get("excluded_observations", 0.0) >= 1.0
+
+
+def test_change_detector_ignores_excluded_watermark_pixels() -> None:
+    previous = np.zeros((100, 200, 3), dtype=np.uint8)
+    current = previous.copy()
+    current[70:95, 150:195] = 255
+    excluded = ((150.0, 60.0), (200.0, 60.0), (200.0, 100.0), (150.0, 100.0))
+
+    result = TileChangeDetector().compare(
+        previous,
+        current,
+        MotionEstimate(np.eye(3), valid=True, confidence=1.0),
+        excluded_polygons=(excluded,),
+    )
+
+    assert result.changed_ratio == 0.0
+    assert result.scopes == ()
 
 
 def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> None:

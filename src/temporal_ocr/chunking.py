@@ -403,6 +403,7 @@ def run_video_ocr_chunked(
     thread_type: str = "AUTO",
     ocr_threads_per_worker: int | None = None,
     short_video_threshold_sec: float = DEFAULT_SHORT_VIDEO_THRESHOLD_SEC,
+    exclude_regions: list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
 ) -> OCRExecution:
     """Run automatic or explicit seekable chunks and merge their events."""
     video_path = Path(video).expanduser().resolve()
@@ -436,6 +437,7 @@ def run_video_ocr_chunked(
             sample_fps=sample_fps,
             max_width=max_width,
             thread_type=thread_type,
+            exclude_regions=exclude_regions,
         )
         metadata = json.loads(execution.metadata_path.read_text(encoding="utf-8"))
         metadata["mode"] = "auto_continuous"
@@ -445,6 +447,7 @@ def run_video_ocr_chunked(
             "effective_chunk_sec": None,
             "short_video_threshold_sec": short_video_threshold_sec,
             "chunk_count": 1,
+            "exclude_regions": exclude_regions or [],
         }
         write_run_metadata(execution.metadata_path, metadata)
         return execution
@@ -501,6 +504,7 @@ def run_video_ocr_chunked(
             runtime=get_runtime(),
             intra_op_num_threads=effective_ocr_threads,
             inter_op_num_threads=config.ocr.inter_op_num_threads,
+            exclude_regions=exclude_regions,
         )
 
     started = time.perf_counter()
@@ -561,6 +565,7 @@ def run_video_ocr_chunked(
             "sample_fps": sample_fps,
             "max_width": max_width,
             "thread_type": thread_type,
+            "exclude_regions": exclude_regions or [],
         },
         "chunking": {
             "strategy": "automatic" if automatic_chunking else "explicit",

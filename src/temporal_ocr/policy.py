@@ -68,10 +68,17 @@ class RuleBasedPolicyScheduler:
             maximum_wait *= 0.70
             reasons.append("short_lived_text")
 
-        if signals.gpu_utilization < 0.35 and pressure > 0:
+        if (
+            signals.gpu_utilization is not None
+            and signals.gpu_utilization < 0.35
+            and pressure > 0
+        ):
             batch_wait -= 10
             reasons.append("gpu_headroom")
-        elif signals.gpu_utilization > 0.90:
+        elif (
+            signals.gpu_utilization is not None
+            and signals.gpu_utilization > 0.90
+        ):
             batch_wait += 10
             reasons.append("gpu_saturated")
 

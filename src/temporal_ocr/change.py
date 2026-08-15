@@ -34,6 +34,8 @@ class TileChangeDetector:
         previous: np.ndarray,
         current: np.ndarray,
         motion: MotionEstimate,
+        *,
+        excluded_polygons: tuple[Polygon, ...] = (),
     ) -> ChangeMapResult:
         current_gray = to_gray(current)
         previous_gray = to_gray(previous)
@@ -46,6 +48,15 @@ class TileChangeDetector:
         aligned = compensate_previous(previous_gray, motion, current_gray.shape[:2])
         delta = cv2.absdiff(aligned, current_gray).astype(np.float32) / 255.0
         height, width = current_gray.shape[:2]
+        # Static watermarks and other caller-declared regions must not create
+        # local-change requests.  Compute tile means over the remaining pixels
+        # instead of merely zeroing the excluded area, otherwise a large mask
+        # would artificially dilute nearby legitimate changes.
+        valid_mask = np.ones((height, width), dtype=np.uint8)
+        for polygon in excluded_polygons:
+            points = np.asarray(polygon, dtype=np.float32).astype(np.int32)
+            cv2.fillConvexPoly(valid_mask, points, 0)
+        delta[valid_mask == 0] = 0.0
         changed: list[tuple[int, int]] = []
         scores: list[float] = []
         changed_mask = np.zeros((self.rows, self.cols), dtype=np.uint8)
@@ -55,7 +66,11 @@ class TileChangeDetector:
             for col in range(self.cols):
                 x1 = col * width // self.cols
                 x2 = (col + 1) * width // self.cols
-                tile_score = float(delta[y1:y2, x1:x2].mean())
+                tile_valid = valid_mask[y1:y2, x1:x2].astype(bool)
+                if not np.any(tile_valid):
+                    tile_score = 0.0
+                else:
+                    tile_score = float(delta[y1:y2, x1:x2][tile_valid].mean())
                 scores.append(tile_score)
                 if tile_score >= self.threshold:
                     changed.append((row, col))

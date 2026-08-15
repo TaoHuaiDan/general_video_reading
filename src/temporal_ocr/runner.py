@@ -9,6 +9,7 @@ from typing import Any
 
 from temporal_ocr.config import EngineConfig
 from temporal_ocr.engine import TemporalOCREngine
+from temporal_ocr.geometry import validate_normalized_regions
 from temporal_ocr.output import write_events, write_run_metadata
 from temporal_ocr.rapidocr_backend import (
     RapidOCRBatchRecognizer,
@@ -65,6 +66,7 @@ def run_video_ocr(
     runtime: RapidOCRRuntime | None = None,
     intra_op_num_threads: int | None = None,
     inter_op_num_threads: int | None = None,
+    exclude_regions: list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
 ) -> OCRExecution:
     """Run the existing engine and write its stable JSONL/JSON artifacts."""
     video_path = Path(video).expanduser().resolve()
@@ -82,6 +84,7 @@ def run_video_ocr(
         raise ValueError("intra_op_num_threads must be positive")
     if inter_op_num_threads is not None and inter_op_num_threads <= 0:
         raise ValueError("inter_op_num_threads must be positive")
+    normalized_exclude_regions = validate_normalized_regions(exclude_regions)
 
     config = EngineConfig.load(config_path) if config_path else EngineConfig()
     source = PyAVFrameSource(
@@ -113,6 +116,7 @@ def run_video_ocr(
         RapidOCRDetector(runtime=runtime),
         RapidOCRBatchRecognizer(runtime=runtime),
         config=config,
+        exclude_regions=normalized_exclude_regions,
     )
     result = engine.run(frames)
 
@@ -132,6 +136,7 @@ def run_video_ocr(
         "frame_id_offset": frame_id_offset,
         "intra_op_num_threads": intra_op_num_threads,
         "inter_op_num_threads": inter_op_num_threads,
+        "exclude_regions": [list(region) for region in normalized_exclude_regions],
     }
     metadata["artifacts"] = {
         "events": str(events_path),

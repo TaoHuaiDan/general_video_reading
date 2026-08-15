@@ -26,6 +26,7 @@ import cv2
 from mcp.server.fastmcp import FastMCP
 
 from temporal_ocr.chunking import run_video_ocr_chunked
+from temporal_ocr.geometry import validate_normalized_regions
 from temporal_ocr.runner import OCRExecution, run_video_ocr
 
 
@@ -247,8 +248,10 @@ def _submit_ocr(
     sample_fps: float | None,
     max_width: int | None,
     thread_type: str,
+    exclude_regions: list[list[float]] | None,
 ) -> dict[str, Any]:
     video_path = _validate_video(video)
+    normalized_exclude_regions = validate_normalized_regions(exclude_regions)
     job_id = f"{kind}-{uuid.uuid4().hex[:12]}"
     target = _JOBS.allocate_output_dir(output_dir, job_id)
 
@@ -262,6 +265,7 @@ def _submit_ocr(
             sample_fps=sample_fps,
             max_width=max_width,
             thread_type=thread_type,
+            exclude_regions=normalized_exclude_regions,
         )
         return _compact_execution(execution)
 
@@ -283,6 +287,7 @@ def ocr_video(
     thread_type: str = "AUTO",
     ocr_threads_per_worker: int | None = None,
     short_video_threshold_sec: float = 300.0,
+    exclude_regions: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     """Start asynchronous OCR with automatic long-video chunk planning."""
     video_path = _validate_video(video)
@@ -300,6 +305,7 @@ def ocr_video(
         raise ValueError("ocr_threads_per_worker must be positive")
     if short_video_threshold_sec < 0:
         raise ValueError("short_video_threshold_sec must be non-negative")
+    normalized_exclude_regions = validate_normalized_regions(exclude_regions)
     job_id = f"ocr-auto-{uuid.uuid4().hex[:12]}"
     target = _JOBS.allocate_output_dir(output_dir, job_id)
 
@@ -318,6 +324,7 @@ def ocr_video(
             thread_type=thread_type,
             ocr_threads_per_worker=ocr_threads_per_worker,
             short_video_threshold_sec=short_video_threshold_sec,
+            exclude_regions=normalized_exclude_regions,
         )
         return _compact_execution(execution)
 
@@ -339,6 +346,7 @@ def ocr_video_chunked(
     thread_type: str = "AUTO",
     ocr_threads_per_worker: int | None = None,
     short_video_threshold_sec: float = 300.0,
+    exclude_regions: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     """Start automatic or explicit parallel chunk OCR over a local video file."""
     video_path = _validate_video(video)
@@ -356,6 +364,7 @@ def ocr_video_chunked(
         raise ValueError("ocr_threads_per_worker must be positive")
     if short_video_threshold_sec < 0:
         raise ValueError("short_video_threshold_sec must be non-negative")
+    normalized_exclude_regions = validate_normalized_regions(exclude_regions)
     job_id = f"ocr-chunked-{uuid.uuid4().hex[:12]}"
     target = _JOBS.allocate_output_dir(output_dir, job_id)
 
@@ -374,6 +383,7 @@ def ocr_video_chunked(
             thread_type=thread_type,
             ocr_threads_per_worker=ocr_threads_per_worker,
             short_video_threshold_sec=short_video_threshold_sec,
+            exclude_regions=normalized_exclude_regions,
         )
         return _compact_execution(execution)
 
@@ -390,6 +400,7 @@ def ocr_segment(
     sample_fps: float | None = 1.0,
     max_width: int | None = 1280,
     thread_type: str = "AUTO",
+    exclude_regions: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     """Start asynchronous OCR for a bounded video segment."""
     if start_sec < 0 or end_sec < 0 or start_sec > end_sec:
@@ -404,6 +415,7 @@ def ocr_segment(
         sample_fps=sample_fps,
         max_width=max_width,
         thread_type=thread_type,
+        exclude_regions=exclude_regions,
     )
 
 
@@ -416,12 +428,14 @@ def benchmark_ocr(
     sample_fps: float | None = 1.0,
     max_width: int | None = 1280,
     thread_type: str = "AUTO",
+    exclude_regions: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     """Start an asynchronous A/B benchmark over several config files."""
     video_path = _validate_video(video)
     paths = config_paths or [None]
     if len(paths) > 8:
         raise ValueError("benchmark_ocr accepts at most 8 config paths")
+    normalized_exclude_regions = validate_normalized_regions(exclude_regions)
     job_id = f"benchmark-{uuid.uuid4().hex[:12]}"
     target = _JOBS.allocate_output_dir(output_dir, job_id)
 
@@ -438,6 +452,7 @@ def benchmark_ocr(
                 sample_fps=sample_fps,
                 max_width=max_width,
                 thread_type=thread_type,
+                exclude_regions=normalized_exclude_regions,
             )
             runs.append({"name": label, **_compact_execution(execution)})
         return {"output_dir": str(target), "runs": runs}

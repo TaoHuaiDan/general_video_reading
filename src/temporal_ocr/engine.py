@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -19,6 +19,7 @@ from temporal_ocr.geometry import (
     candidate_quality,
     canonicalize_crop,
     image_signature,
+    normalized_region_polygon,
     polygon_area,
     polygon_bbox,
     polygon_coverage,
@@ -26,6 +27,7 @@ from temporal_ocr.geometry import (
     polygon_iou,
     to_gray,
     transform_polygon,
+    validate_normalized_regions,
 )
 from temporal_ocr.motion import GlobalMotionEstimator, identity_motion
 from temporal_ocr.policy import RuleBasedPolicyScheduler
@@ -77,11 +79,13 @@ class TemporalOCREngine:
         *,
         config: EngineConfig | None = None,
         cache: RecognitionCache | None = None,
+        exclude_regions: Iterable[Iterable[float]] | None = None,
     ) -> None:
         self.config = config or EngineConfig()
         self.detector = detector
         self.recognizer = recognizer
         self.cache = cache or RecognitionCache()
+        self.exclude_regions = validate_normalized_regions(exclude_regions)
         self._reset_run_state()
 
     def _reset_run_state(self) -> None:
@@ -102,6 +106,25 @@ class TemporalOCREngine:
         self._results: dict[int, OCRResult] = {}
         self._geometry_refresh_cooldown_until: dict[int, float] = {}
         self._geometry_refresh_last_refresh_at: dict[int, float] = {}
+
+    def _exclude_polygons(self, width: int, height: int) -> tuple[Polygon, ...]:
+        """Return the caller's normalized ignore rectangles in pixel space."""
+        return tuple(
+            normalized_region_polygon(region, width, height)
+            for region in self.exclude_regions
+        )
+
+    @staticmethod
+    def _is_excluded(
+        polygon: Polygon,
+        excluded_polygons: tuple[Polygon, ...],
+        *,
+        minimum_overlap: float = 0.35,
+    ) -> bool:
+        return any(
+            polygon_coverage(polygon, excluded) >= minimum_overlap
+            for excluded in excluded_polygons
+        )
 
     @staticmethod
     def _merge_observations(
@@ -219,6 +242,8 @@ class TemporalOCREngine:
             polygon = track.latest.polygon
             if getattr(motion, "valid", False):
                 polygon = transform_polygon(polygon, np.asarray(motion.matrix))
+            if self._is_excluded(polygon, request.exclude_regions):
+                continue
             matching_scopes = tuple(
                 scope
                 for scope in request.scopes
@@ -532,6 +557,7 @@ class TemporalOCREngine:
             last_timestamp = frame.timestamp
             image = np.asarray(frame.image)
             luma = np.asarray(frame.luma) if frame.luma is not None else to_gray(image)
+            excluded_polygons = self._exclude_polygons(image.shape[1], image.shape[0])
 
             if previous_luma is None:
                 motion = identity_motion()
@@ -547,12 +573,17 @@ class TemporalOCREngine:
                     motion = self.motion.estimate(
                         previous_luma,
                         luma,
-                        excluded_polygons=excluded,
+                        excluded_polygons=(*excluded, *excluded_polygons),
                     )
                 profiler.profile.motion_estimates += 1
                 profiler.profile.valid_motion_estimates += int(motion.valid)
                 with profiler.stage("change_map"):
-                    change = self.change.compare(previous_luma, luma, motion)
+                    change = self.change.compare(
+                        previous_luma,
+                        luma,
+                        motion,
+                        excluded_polygons=excluded_polygons,
+                    )
                 scene_cut = (
                     change.score >= self.config.detection.scene_change_score_threshold
                     and change.changed_ratio >= self.config.detection.scene_change_ratio_threshold
@@ -616,6 +647,10 @@ class TemporalOCREngine:
                 decision=decision,
                 motion_reliable=motion_reliable,
             )
+            requests = [
+                replace(request, exclude_regions=excluded_polygons)
+                for request in requests
+            ]
             observations: list[DetectionObservation] = []
             overflow_scopes: list[Polygon] = []
             overflow_geometry_ids: list[int] = []
@@ -656,6 +691,18 @@ class TemporalOCREngine:
                                 )
                             )
                             uncovered += tuple(request_overflow)
+                        # A change scope fully covered by an ignore region is
+                        # pure watermark noise; do not launch a local detector
+                        # call for it.  Large scopes that merely contain a
+                        # corner watermark are retained for nearby text.
+                        uncovered = tuple(
+                            scope
+                            for scope in uncovered
+                            if not any(
+                                polygon_coverage(scope, excluded) >= 0.80
+                                for excluded in request.exclude_regions
+                            )
+                        )
                         uncovered = self._coalesce_scopes(uncovered)
                         if not uncovered:
                             profiler.count("local_requests_fully_guided")
@@ -667,6 +714,7 @@ class TemporalOCREngine:
                             reason=request.reason,
                             target_width=request.target_width,
                             scopes=uncovered,
+                            exclude_regions=request.exclude_regions,
                         )
                     else:
                         profiler.profile.detection_requests_audit += 1
@@ -680,6 +728,19 @@ class TemporalOCREngine:
                         scope_area = float(image.shape[0] * image.shape[1])
                     detector_started = time.perf_counter()
                     detected = self.detector.detect(frame, request)
+                    before_exclusion_count = len(detected)
+                    detected = [
+                        observation
+                        for observation in detected
+                        if not self._is_excluded(
+                            observation.polygon,
+                            request.exclude_regions,
+                        )
+                    ]
+                    profiler.count(
+                        "excluded_observations",
+                        before_exclusion_count - len(detected),
+                    )
                     profiler.count(f"detector_calls_{tier_name}")
                     profiler.count(
                         f"detector_sec_{tier_name}",

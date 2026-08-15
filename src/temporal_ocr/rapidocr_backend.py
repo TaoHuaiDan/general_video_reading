@@ -10,7 +10,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from temporal_ocr.geometry import as_polygon, polygon_bbox
+from temporal_ocr.geometry import as_polygon, polygon_bbox, polygon_coverage
 from temporal_ocr.types import (
     DetectionObservation,
     DetectionRequest,
@@ -94,11 +94,20 @@ class RapidOCRDetector:
             points /= max(scale, 1e-9)
             points[:, 0] += offset_x
             points[:, 1] += offset_y
+            polygon = as_polygon(points)
+            if any(
+                polygon_coverage(polygon, excluded) >= 0.35
+                for excluded in request.exclude_regions
+            ):
+                # Keep the exclusion at the backend boundary as well as in
+                # the engine.  This prevents watermark boxes from entering
+                # geometry/content tracking even with a custom postprocessor.
+                continue
             observations.append(
                 DetectionObservation(
                     frame_id=frame.frame_id,
                     timestamp=frame.timestamp,
-                    polygon=as_polygon(points),
+                    polygon=polygon,
                     confidence=float(score),
                     tier=request.tier,
                 )

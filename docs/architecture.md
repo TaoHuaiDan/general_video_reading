@@ -46,6 +46,14 @@ FrameSource
   -> TextEvent output
 ```
 
+Caller-declared static ignore regions (for example, a video watermark) are
+normalized rectangles. They are converted to per-frame polygons and applied
+before motion/change planning, passed through detector requests, and checked
+again on detector output. This avoids both watermark-triggered local audits
+and accidental geometry/content tracks. The regions are request-scoped rather
+than hard-coded as a video-type rule, so the same engine remains usable for
+other sources.
+
 ## Global motion
 
 The initial implementation estimates an affine transform from sparse optical flow and RANSAC.

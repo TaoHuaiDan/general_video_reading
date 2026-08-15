@@ -39,6 +39,13 @@ environment.  The server uses stdio and does not open a network listener.
 - `list_runs`: list jobs known by the current server process.
 - `cleanup_run`: remove one completed run after `confirm=true`.
 
+All OCR tools that process video accept an optional `exclude_regions` argument.
+Use normalized rectangles in the form `[left, top, right, bottom]`, with every
+coordinate between 0 and 1. For example, a bottom-right watermark can be
+passed as `[[0.78, 0.88, 1.0, 1.0]]`. The engine masks that area from motion and
+change analysis and drops detector observations overlapping it. The same
+regions are reused by every long-video chunk.
+
 The default OCR request samples at 1 FPS and caps decoded frames at 1280 px.
 Pass `config_path`, `sample_fps`, and `max_width` explicitly for a benchmark.
 The high-speed project config is `benchmarks/config-fast.json`.

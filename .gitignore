@@ -9,3 +9,9 @@ dist/
 *.egg-info/
 artifacts/
 benchmarks/output/
+
+# Local benchmark media and generated OCR deliverables
+*.mp4
+*.mkv
+*.webm
+series_ocr/
