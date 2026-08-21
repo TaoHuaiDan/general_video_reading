@@ -60,6 +60,7 @@ class TileChangeDetector:
         changed: list[tuple[int, int]] = []
         scores: list[float] = []
         changed_mask = np.zeros((self.rows, self.cols), dtype=np.uint8)
+        valid_tile_count = 0
         for row in range(self.rows):
             y1 = row * height // self.rows
             y2 = (row + 1) * height // self.rows
@@ -68,10 +69,13 @@ class TileChangeDetector:
                 x2 = (col + 1) * width // self.cols
                 tile_valid = valid_mask[y1:y2, x1:x2].astype(bool)
                 if not np.any(tile_valid):
-                    tile_score = 0.0
-                else:
-                    tile_score = float(delta[y1:y2, x1:x2][tile_valid].mean())
+                    # A fully excluded tile is outside change analysis: it
+                    # must neither raise the score nor count as an unchanged
+                    # tile that dilutes ``changed_ratio``.
+                    continue
+                tile_score = float(delta[y1:y2, x1:x2][tile_valid].mean())
                 scores.append(tile_score)
+                valid_tile_count += 1
                 if tile_score >= self.threshold:
                     changed.append((row, col))
                     changed_mask[row, col] = 1
@@ -105,7 +109,9 @@ class TileChangeDetector:
                 )
         return ChangeMapResult(
             score=float(np.mean(scores)) if scores else 0.0,
-            changed_ratio=len(changed) / float(self.rows * self.cols),
+            changed_ratio=(
+                len(changed) / float(valid_tile_count) if valid_tile_count else 0.0
+            ),
             changed_tiles=tuple(changed),
             scopes=tuple(scopes),
             pixel_delta=delta,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from temporal_ocr.config import DetectionConfig, PolicyConfig
+from temporal_ocr.config import ContentConfig, DetectionConfig, PolicyConfig
 from temporal_ocr.types import PolicyDecision, RuntimeSignals
 
 
@@ -17,9 +17,13 @@ class RuleBasedPolicyScheduler:
         self,
         policy: PolicyConfig | None = None,
         detection: DetectionConfig | None = None,
+        content: ContentConfig | None = None,
     ) -> None:
         self.policy = policy or PolicyConfig()
         self.detection = detection or DetectionConfig()
+        # The caller's ContentConfig wait values are the baseline the runtime
+        # adaptation starts from; they are never written back.
+        self.content = content or ContentConfig()
         self._last: PolicyDecision | None = None
 
     def decide(self, signals: RuntimeSignals) -> PolicyDecision:
@@ -27,8 +31,8 @@ class RuleBasedPolicyScheduler:
         probe = self.policy.default_probe_interval_sec
         audit = self.detection.audit_interval_sec
         width = self.detection.fast_width
-        stable_wait = 0.45
-        maximum_wait = 1.8
+        stable_wait = self.content.stable_wait_sec
+        maximum_wait = self.content.maximum_wait_sec
         batch_size = self.policy.default_batch_size
         batch_wait = self.policy.default_batch_wait_ms
 

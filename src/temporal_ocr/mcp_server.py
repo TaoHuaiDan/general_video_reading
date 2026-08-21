@@ -78,18 +78,44 @@ class _Job:
 class _JobStore:
     """Small in-process job registry with one bounded OCR worker by default."""
 
-    def __init__(self) -> None:
-        configured_root = os.environ.get("TEMPORAL_OCR_MCP_OUTPUT_ROOT")
-        self.output_root = (
-            Path(configured_root).expanduser().resolve()
-            if configured_root
-            else (Path.cwd() / "artifacts" / "ocr-mcp").resolve()
-        )
+    def __init__(
+        self,
+        *,
+        output_root: str | Path | None = None,
+        max_finished_jobs: int | None = None,
+    ) -> None:
+        if output_root is not None:
+            self.output_root = Path(output_root).expanduser().resolve()
+        else:
+            configured_root = os.environ.get("TEMPORAL_OCR_MCP_OUTPUT_ROOT")
+            self.output_root = (
+                Path(configured_root).expanduser().resolve()
+                if configured_root
+                else (Path.cwd() / "artifacts" / "ocr-mcp").resolve()
+            )
         self.output_root.mkdir(parents=True, exist_ok=True)
         configured_workers = int(os.environ.get("TEMPORAL_OCR_MCP_WORKERS", "1"))
         self._executor = ThreadPoolExecutor(max_workers=max(1, min(configured_workers, 4)))
+        if max_finished_jobs is None:
+            max_finished_jobs = int(os.environ.get("TEMPORAL_OCR_MCP_MAX_JOBS", "100"))
+        if max_finished_jobs < 1:
+            raise ValueError("max_finished_jobs must be positive")
+        # Finished jobs only carry a small result payload, but an MCP server
+        # process can serve many runs; retain the most recent ones.
+        self._max_finished_jobs = max_finished_jobs
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
+
+    def _prune_finished_locked(self) -> None:
+        finished = [
+            job for job in self._jobs.values() if job.status in {"completed", "failed"}
+        ]
+        overflow = len(finished) - self._max_finished_jobs
+        if overflow <= 0:
+            return
+        finished.sort(key=lambda item: item.created_at)
+        for job in finished[:overflow]:
+            del self._jobs[job.job_id]
 
     def allocate_output_dir(self, requested: str | None, job_id: str) -> Path:
         target = Path(requested).expanduser().resolve() if requested else self.output_root / job_id
@@ -122,6 +148,7 @@ class _JobStore:
         )
         with self._lock:
             self._jobs[job_id] = job
+            self._prune_finished_locked()
         future = self._executor.submit(self._run, job_id, task)
         with self._lock:
             job.future = future
@@ -139,11 +166,18 @@ class _JobStore:
                 job.status = "failed"
                 job.finished_at = _utc_now()
                 job.error = f"{type(exc).__name__}: {exc}"
+                self._prune_finished_locked()
             return
         with self._lock:
             job.status = "completed"
             job.finished_at = _utc_now()
             job.result = result
+            self._prune_finished_locked()
+
+    def forget(self, job_id: str) -> None:
+        """Drop one job from the registry, e.g. after its cleanup."""
+        with self._lock:
+            self._jobs.pop(job_id, None)
 
     def get(self, job_id: str) -> _Job:
         with self._lock:
@@ -504,15 +538,25 @@ def get_run_result(
             raise ValueError("max_events must be between 1 and 1000")
         if event_offset < 0:
             raise ValueError("event_offset must be non-negative")
-        event_path = Path(str(result["events"]))
-        rows = [
-            json.loads(line)
-            for line in event_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        payload["events"] = rows[event_offset : event_offset + max_events]
+        # Stream the JSONL file instead of materializing the whole OCR
+        # output: memory stays proportional to the requested preview size.
+        events: list[dict[str, Any]] = []
+        valid_index = 0
+        with Path(str(result["events"])).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                if valid_index < event_offset:
+                    valid_index += 1
+                    continue
+                if len(events) > max_events:
+                    break
+                events.append(json.loads(line))
+                valid_index += 1
+        events_truncated = len(events) > max_events
+        payload["events"] = events[:max_events]
         payload["events_offset"] = event_offset
-        payload["events_truncated"] = event_offset + max_events < len(rows)
+        payload["events_truncated"] = events_truncated
     return payload
 
 
@@ -539,6 +583,9 @@ def cleanup_run(job_id: str, confirm: bool = False) -> dict[str, Any]:
         raise PermissionError("cleanup is limited to the MCP output root")
     if target.exists():
         shutil.rmtree(target)
+    # Keep the registry consistent with the filesystem: a cleaned-up run no
+    # longer has artifacts to report.
+    _JOBS.forget(job_id)
     return {"job_id": job_id, "removed": str(target)}
 
 

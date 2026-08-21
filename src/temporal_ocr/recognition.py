@@ -3,23 +3,45 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
 
 from temporal_ocr.backends import TextRecognizer
 from temporal_ocr.types import OCRResult, OCRTask
 
+# Entries hold only an OCR result keyed by a 32-byte digest, so a few thousand
+# entries stay well under a few megabytes while still covering the distinct
+# normalized crops of a feature-length video.
+DEFAULT_CACHE_MAX_ENTRIES = 4096
+
 
 class RecognitionCache:
-    """Exact normalized-image cache; perceptual reuse remains opt-in later."""
+    """Exact normalized-image cache; perceptual reuse remains opt-in later.
 
-    def __init__(self) -> None:
-        self._items: dict[tuple[str, bytes], OCRResult] = {}
+    The cache is a bounded LRU when ``max_entries`` is given.  Passing
+    ``None`` restores unbounded retention for callers that manage memory
+    themselves.
+    """
+
+    def __init__(self, max_entries: int | None = DEFAULT_CACHE_MAX_ENTRIES) -> None:
+        if max_entries is not None and max_entries <= 0:
+            raise ValueError("max_entries must be positive when provided")
+        self._max_entries = max_entries
+        self._items: OrderedDict[tuple[str, bytes], OCRResult] = OrderedDict()
 
     def get(self, backend: str, signature: bytes) -> OCRResult | None:
-        return self._items.get((backend, signature))
+        key = (backend, signature)
+        item = self._items.get(key)
+        if item is not None:
+            self._items.move_to_end(key)
+        return item
 
     def put(self, backend: str, signature: bytes, result: OCRResult) -> None:
-        self._items[(backend, signature)] = result
+        key = (backend, signature)
+        self._items[key] = result
+        if self._max_entries is not None:
+            while len(self._items) > self._max_entries:
+                self._items.popitem(last=False)
 
     def __len__(self) -> int:
         return len(self._items)

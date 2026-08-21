@@ -101,6 +101,37 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return float(ordered[index])
 
 
+def _max_matching_size(pairs: list[tuple[int, int]]) -> int:
+    """Return the maximum bipartite matching size via Kuhn's algorithm.
+
+    The benchmark contract is completeness-first: greedy score-first pairing
+    cannot guarantee maximum cardinality and would under-report Event Recall
+    whenever two references compete for one high-scoring prediction.  Inputs
+    are tiny (events per run), so a small augmenting-path matcher is enough.
+    """
+    adjacency: dict[int, list[int]] = {}
+    for ref_index, pred_index in pairs:
+        adjacency.setdefault(ref_index, []).append(pred_index)
+
+    match_of_pred: dict[int, int] = {}
+
+    def try_assign(ref_index: int, visited: set[int]) -> bool:
+        for pred_index in adjacency.get(ref_index, ()):
+            if pred_index in visited:
+                continue
+            visited.add(pred_index)
+            if pred_index not in match_of_pred or try_assign(match_of_pred[pred_index], visited):
+                match_of_pred[pred_index] = ref_index
+                return True
+        return False
+
+    matched = 0
+    for ref_index in sorted(adjacency):
+        if try_assign(ref_index, set()):
+            matched += 1
+    return matched
+
+
 def evaluate_events(
     reference: list[TextEvent],
     predicted: list[TextEvent],
@@ -126,16 +157,32 @@ def evaluate_events(
                 score = 0.55 * text_score + 0.25 * time_score + 0.20 * space_score
                 pairs.append((score, ref_index, pred_index, text_score, time_score, space_score))
 
+    # First maximize the number of matched pairs, then pick higher-quality
+    # pairs among maximum-cardinality solutions.  A candidate is accepted
+    # only if the remaining graph can still reach the target cardinality.
+    target_matches = _max_matching_size(
+        [(ref_index, pred_index) for _s, ref_index, pred_index, *_ in pairs]
+    )
     matched_ref: set[int] = set()
     matched_pred: set[int] = set()
     matches: list[tuple[int, int, float, float]] = []
-    for _score, ref_index, pred_index, _text, time_score, space_score in sorted(
-        pairs, reverse=True
-    ):
+    ordered_pairs = sorted(pairs, key=lambda item: (-item[0], item[1], item[2]))
+    for _score, ref_index, pred_index, _text, time_score, space_score in ordered_pairs:
+        if len(matches) >= target_matches:
+            break
         if ref_index in matched_ref or pred_index in matched_pred:
             continue
         matched_ref.add(ref_index)
         matched_pred.add(pred_index)
+        remaining = [
+            (candidate_ref, candidate_pred)
+            for _s, candidate_ref, candidate_pred, *_ in pairs
+            if candidate_ref not in matched_ref and candidate_pred not in matched_pred
+        ]
+        if len(matches) + 1 + _max_matching_size(remaining) < target_matches:
+            matched_ref.discard(ref_index)
+            matched_pred.discard(pred_index)
+            continue
         matches.append((ref_index, pred_index, time_score, space_score))
 
     total_reference_chars = 0

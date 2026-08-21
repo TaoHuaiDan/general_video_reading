@@ -233,3 +233,23 @@ def test_motion_unreliable_audit_is_rate_limited() -> None:
     assert [item.tier for item in first] == [DetectionTier.AUDIT]
     assert [item.tier for item in too_soon] == [DetectionTier.FAST]
     assert [item.tier for item in due] == [DetectionTier.AUDIT]
+
+
+def test_policy_uses_content_config_wait_baselines() -> None:
+    scheduler = RuleBasedPolicyScheduler(
+        PolicyConfig(),
+        DetectionConfig(),
+        ContentConfig(stable_wait_sec=0.90, maximum_wait_sec=3.0),
+    )
+
+    decision = scheduler.decide(RuntimeSignals())
+
+    assert decision.stable_wait_sec == 0.90
+    assert decision.maximum_wait_sec == 3.0
+
+
+def test_policy_default_waits_match_legacy_baseline() -> None:
+    decision = RuleBasedPolicyScheduler().decide(RuntimeSignals())
+
+    assert decision.stable_wait_sec == 0.45
+    assert decision.maximum_wait_sec == 1.8

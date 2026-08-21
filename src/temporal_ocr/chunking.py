@@ -210,9 +210,13 @@ def _should_merge(
     left_end = float(left.get("end", left_start))
     right_start = float(right.get("start", 0.0))
     right_end = float(right.get("end", right_start))
+    # Chunked reads overlap around every boundary, so two observations of the
+    # same underlying event always coexist in time.  A temporal gap means the
+    # event ended before the other chunk even began reading it: that is a
+    # genuine reappearance, not a boundary duplicate.  Event recall therefore
+    # wins over duplicate suppression here.
     temporal_overlap = min(left_end, right_end) - max(left_start, right_start)
-    temporal_gap = max(0.0, max(left_start, right_start) - min(left_end, right_end))
-    if temporal_overlap < -1e-6 and temporal_gap > max(1.25, overlap_sec + 0.5):
+    if temporal_overlap < -1e-6:
         return False
 
     left_text = _event_text(left)
@@ -221,7 +225,15 @@ def _should_merge(
         return False
     text_score = text_similarity(left_text, right_text)
     spatial_score = _spatial_similarity(left, right)
-    if text_score >= 0.92 and (spatial_score >= 0.08 or temporal_overlap >= 0):
+    if _event_polygon(left) is not None and _event_polygon(right) is not None:
+        # Identical text at a clearly different location is a distinct event,
+        # no matter how much it overlaps in time.
+        if spatial_score < 0.08:
+            return False
+    elif temporal_overlap <= 0.0:
+        # Without geometry evidence, require actual coexistence.
+        return False
+    if text_score >= 0.92:
         return True
     return spatial_score >= 0.25 and (text_score >= 0.72 or _is_prefix(left_text, right_text))
 

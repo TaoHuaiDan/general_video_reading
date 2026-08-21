@@ -18,6 +18,7 @@ from temporal_ocr.detection import HierarchicalDetectionPlanner
 from temporal_ocr.geometry import (
     candidate_quality,
     canonicalize_crop,
+    exact_signature,
     image_signature,
     normalized_region_polygon,
     polygon_area,
@@ -36,12 +37,14 @@ from temporal_ocr.recognition import OCRBatchQueue, RecognitionCache, recognize_
 from temporal_ocr.tracking import ContentTracker, GeometryTracker
 from temporal_ocr.types import (
     CanonicalObservation,
+    ContentState,
     ContentTrack,
     DetectionObservation,
     DetectionRequest,
     DetectionTier,
     FramePacket,
     OCRResult,
+    OCRTask,
     PolicyDecision,
     Polygon,
     RuntimeSignals,
@@ -98,14 +101,41 @@ class TemporalOCREngine:
         )
         self.planner = HierarchicalDetectionPlanner(self.config.detection)
         self.geometry = GeometryTracker(self.config.tracking)
-        self.content = ContentTracker(self.config.content)
-        self.policy = RuleBasedPolicyScheduler(self.config.policy, self.config.detection)
+        # The content tracker owns a runtime copy of ContentConfig; the
+        # caller's canonical EngineConfig is never mutated by a run.
+        self.content = ContentTracker(replace(self.config.content))
+        self.policy = RuleBasedPolicyScheduler(
+            self.config.policy,
+            self.config.detection,
+            self.config.content,
+        )
         self.ocr_queue = OCRBatchQueue()
         self._cached_content_ids: set[int] = set()
         self._queued_content_ids: set[int] = set()
         self._results: dict[int, OCRResult] = {}
         self._geometry_refresh_cooldown_until: dict[int, float] = {}
         self._geometry_refresh_last_refresh_at: dict[int, float] = {}
+
+    def _content_runtime_signals(self) -> tuple[float, float]:
+        """Return (average_text_lifetime, typewriter_score) for active content.
+
+        Finalized tracks belong to scenes that already ended; including them
+        let a single typewriter scene pollute policy decisions for the rest
+        of a long video.  With no active content both signals are explicitly
+        zero.
+        """
+        active = [
+            track
+            for track in self.content.tracks.values()
+            if track.state != ContentState.FINALIZED
+        ]
+        if not active:
+            return 0.0, 0.0
+        average_lifetime = float(
+            np.mean([item.last_seen - item.first_seen for item in active])
+        )
+        typewriter_score = float(np.mean([item.typewriter_score for item in active]))
+        return average_lifetime, typewriter_score
 
     def _exclude_polygons(self, width: int, height: int) -> tuple[Polygon, ...]:
         """Return the caller's normalized ignore rectangles in pixel space."""
@@ -176,12 +206,18 @@ class TemporalOCREngine:
         scopes: tuple[Polygon, ...],
         observations: list[DetectionObservation],
     ) -> tuple[Polygon, ...]:
+        """Keep only scopes that existing observations themselves cover.
+
+        "Covered" means the observation overlaps enough of the scope.  An
+        observation merely contained inside a large scope says nothing about
+        the rest of that scope, so counting containment as coverage silently
+        dropped undetected text in large change regions.
+        """
         return tuple(
             scope
             for scope in scopes
             if not any(
                 polygon_coverage(scope, item.polygon) >= 0.55
-                or polygon_coverage(item.polygon, scope) >= 0.55
                 for item in observations
             )
         )
@@ -255,9 +291,10 @@ class TemporalOCREngine:
             refresh_confident = track.tracking_confidence >= 0.60
             # An urgent change by itself is not evidence that the geometry is
             # stale: it is usually just new glyph pixels inside an existing
-            # line.  Refresh only when the change spills outside the projected
-            # box (or the scope is structurally much larger), otherwise the
-            # guided observation path remains detector-free.
+            # line.  Refresh when the change spills outside the projected box
+            # or the scope is structurally much larger than the tracked line
+            # (a wrapped-dialogue envelope); otherwise the guided observation
+            # path remains detector-free.
             force_local_refresh = False
             content_id = self.content.by_geometry.get(track.geometry_id)
             content_track = self.content.tracks.get(content_id) if content_id is not None else None
@@ -299,7 +336,9 @@ class TemporalOCREngine:
             if profiler is not None:
                 profiler.count("local_geometry_scope_refresh_candidates", geometry_scope_refresh)
                 profiler.count("local_pixel_overflow_candidates", pixel_overflow)
-            if refresh_allowed and (force_local_refresh or pixel_overflow):
+            if refresh_allowed and (
+                force_local_refresh or pixel_overflow or geometry_scope_refresh
+            ):
                 if profiler is not None:
                     profiler.count("local_geometry_scope_refresh_tracks", geometry_scope_refresh)
                     profiler.count("local_pixel_overflow_refresh_tracks", pixel_overflow)
@@ -452,7 +491,9 @@ class TemporalOCREngine:
         if track.content_id in self._queued_content_ids:
             return
         best = max(track.candidates, key=lambda item: item.quality)
-        cached = self.cache.get(self.recognizer.name, best.signature)
+        # Exact reuse must key on the true crop content; the perceptual
+        # signature is only a change-detection hint and may collide.
+        cached = self.cache.get(self.recognizer.name, exact_signature(best.image))
         if cached is not None:
             result = OCRResult(
                 content_id=track.content_id,
@@ -467,8 +508,6 @@ class TemporalOCREngine:
             self._cached_content_ids.add(result.content_id)
             profiler.profile.cache_hits += 1
             return
-        from temporal_ocr.types import OCRTask
-
         task = OCRTask(
             content_id=track.content_id,
             geometry_id=track.geometry_id,
@@ -498,7 +537,11 @@ class TemporalOCREngine:
                 self._results[result.content_id] = result
                 task = task_by_id[result.content_id]
                 best = max(task.candidates, key=lambda item: item.quality)
-                self.cache.put(self.recognizer.name, best.signature, result)
+                self.cache.put(
+                    self.recognizer.name,
+                    exact_signature(best.image),
+                    result,
+                )
                 track.last_seen = max(track.last_seen, best.timestamp)
 
     def _build_events(self) -> list[TextEvent]:
@@ -605,17 +648,16 @@ class TemporalOCREngine:
             signals.motion_confidence = motion.confidence
             signals.layout_stability = 1.0 - change.changed_ratio
             signals.moving_text_ratio = moving / max(len(active_tracks), 1)
+            # The current detector runs synchronously inside the frame loop,
+            # so no real detection queue exists. This stays a reserved,
+            # always-zero signal for a future async detector; it must not be
+            # fabricated into a fake queue depth.
             signals.detection_queue_length = 0
             signals.ocr_queue_length = len(self.ocr_queue)
-            if self.content.tracks:
-                signals.average_text_lifetime = float(
-                    np.mean(
-                        [item.last_seen - item.first_seen for item in self.content.tracks.values()]
-                    )
-                )
-                signals.typewriter_score = float(
-                    np.mean([item.typewriter_score for item in self.content.tracks.values()])
-                )
+            (
+                signals.average_text_lifetime,
+                signals.typewriter_score,
+            ) = self._content_runtime_signals()
             decision = self.policy.decide(signals)
             self.content.config.stable_wait_sec = decision.stable_wait_sec
             self.content.config.maximum_wait_sec = decision.maximum_wait_sec
@@ -627,6 +669,7 @@ class TemporalOCREngine:
                         "audit_interval_sec": decision.audit_interval_sec,
                         "fast_detection_width": decision.fast_detection_width,
                         "stable_wait_sec": decision.stable_wait_sec,
+                        "maximum_wait_sec": decision.maximum_wait_sec,
                         "batch_size": decision.batch_size,
                         "batch_wait_ms": decision.batch_wait_ms,
                         "reason": list(decision.reason),

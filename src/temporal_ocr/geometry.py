@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Iterable, Sequence
 from typing import TypeAlias
@@ -212,6 +213,22 @@ def image_signature(image: np.ndarray, size: int = 16) -> bytes:
     resized = cv2.resize(gray, (size + 1, size), interpolation=cv2.INTER_AREA)
     bits = resized[:, 1:] > resized[:, :-1]
     return np.packbits(bits.reshape(-1)).tobytes()
+
+
+def exact_signature(image: np.ndarray, *, digest_size: int = 32) -> bytes:
+    """Return a collision-resistant digest of the normalized crop content.
+
+    Unlike :func:`image_signature`, which is a perceptual dHash intended for
+    change detection, this key covers shape, dtype and the raw contiguous
+    pixel bytes, so two different crops can never share a cache entry.  It is
+    the only valid basis for exact OCR result reuse.
+    """
+    contiguous = np.ascontiguousarray(image)
+    digest = hashlib.blake2b(digest_size=digest_size)
+    digest.update(str(contiguous.dtype).encode("ascii"))
+    digest.update(str(contiguous.shape).encode("ascii"))
+    digest.update(contiguous.tobytes())
+    return digest.digest()
 
 
 def signature_distance(left: bytes, right: bytes) -> float:

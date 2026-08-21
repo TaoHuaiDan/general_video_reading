@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from temporal_ocr.backends import CallableDetector, CallableRecognizer
@@ -8,6 +10,7 @@ from temporal_ocr.config import EngineConfig
 from temporal_ocr.engine import TemporalOCREngine
 from temporal_ocr.metrics import evaluate_events
 from temporal_ocr.types import (
+    CanonicalObservation,
     DetectionObservation,
     DetectionRequest,
     DetectionTier,
@@ -33,6 +36,36 @@ def event(event_id: int, text: str, start: float = 0.0, end: float = 2.0) -> Tex
         polygon_history=((start, POLYGON), (end, POLYGON)),
         source_frame_ids=(1,),
     )
+
+
+def test_event_matching_maximizes_cardinality_before_quality() -> None:
+    # R1 can match P1 (best score) or P2; R2 can only match P1.  Greedy
+    # score-first matching takes R1-P1 and loses R2 entirely; a
+    # completeness-first matcher must find two pairs.
+    def poly(left: float, right: float) -> tuple:
+        return ((left, 0.0), (right, 0.0), (right, 50.0), (left, 50.0))
+
+    def make(event_id: int, polygon: tuple) -> TextEvent:
+        return TextEvent(
+            event_id=event_id,
+            geometry_id=event_id,
+            content_id=event_id,
+            start=0.0,
+            end=10.0,
+            text_raw="hello",
+            text_normalized="hello",
+            confidence=0.9,
+            polygon_history=((0.0, polygon), (10.0, polygon)),
+            source_frame_ids=(1,),
+        )
+
+    reference = [make(1, poly(0.0, 200.0)), make(2, poly(160.0, 200.0))]
+    predicted = [make(3, poly(0.0, 180.0)), make(4, poly(0.0, 20.0))]
+
+    report = evaluate_events(reference, predicted)
+
+    assert report.matched_events == 2
+    assert report.event_recall == 1.0
 
 
 def test_event_metrics_cover_recall_accuracy_duplicates_and_throughput() -> None:
@@ -149,6 +182,44 @@ def test_change_detector_ignores_excluded_watermark_pixels() -> None:
     assert result.scopes == ()
 
 
+def test_excluded_tiles_do_not_dilute_change_ratio() -> None:
+    # The left half is a declared ignore region; every remaining valid tile
+    # changes completely.  The ratio must describe the valid tiles only.
+    previous = np.zeros((100, 200, 3), dtype=np.uint8)
+    current = previous.copy()
+    current[0:100, 100:200] = 255
+    left_half = ((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0))
+
+    result = TileChangeDetector().compare(
+        previous,
+        current,
+        MotionEstimate(np.eye(3), valid=True, confidence=1.0),
+        excluded_polygons=(left_half,),
+    )
+
+    assert result.changed_ratio == 1.0
+    assert result.score > 0.0
+
+
+def test_fully_excluded_frame_has_well_defined_zero_statistics() -> None:
+    previous = np.zeros((100, 200, 3), dtype=np.uint8)
+    current = previous.copy()
+    current[0:100, 0:200] = 255
+    everything = ((0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0))
+
+    result = TileChangeDetector().compare(
+        previous,
+        current,
+        MotionEstimate(np.eye(3), valid=True, confidence=1.0),
+        excluded_polygons=(everything,),
+    )
+
+    assert result.score == 0.0
+    assert result.changed_ratio == 0.0
+    assert result.changed_tiles == ()
+    assert result.scopes == ()
+
+
 def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> None:
     frames: list[FramePacket] = []
     for frame_id, timestamp in enumerate((0.0, 1.0, 2.0)):
@@ -187,6 +258,83 @@ def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> 
 
     assert result.profile.output_events <= 2
     assert result.profile.counters.get("ocr_deferred_typewriter", 0.0) >= 1.0
+
+
+def test_engine_run_does_not_mutate_caller_config_and_logs_max_wait() -> None:
+    frames: list[FramePacket] = []
+    for frame_id, timestamp in enumerate((0.0, 0.5, 1.0)):
+        image = np.zeros((120, 220, 3), dtype=np.uint8)
+        image[20:60, 10:110] = 255
+        frames.append(FramePacket(frame_id, timestamp, image))
+
+    def detect(frame, request):
+        return [
+            DetectionObservation(
+                frame_id=frame.frame_id,
+                timestamp=frame.timestamp,
+                polygon=POLYGON,
+                confidence=0.99,
+                tier=request.tier,
+            )
+        ]
+
+    def recognize(tasks):
+        return [OCRResult(task.content_id, "text", 0.99, backend="fake") for task in tasks]
+
+    config = EngineConfig()
+    config.content.stable_wait_sec = 0.90
+    config.content.maximum_wait_sec = 3.0
+    engine = TemporalOCREngine(
+        CallableDetector(detect, name="fake-detector"),
+        CallableRecognizer(recognize, name="fake"),
+        config=config,
+    )
+
+    result = engine.run(frames)
+
+    assert config.content.stable_wait_sec == 0.90
+    assert config.content.maximum_wait_sec == 3.0
+    assert engine.content.config is not config.content
+    assert result.policy_changes
+    assert all("maximum_wait_sec" in entry for entry in result.policy_changes)
+
+
+def test_runtime_signals_ignore_finalized_tracks_and_reset_without_active_content() -> None:
+    from temporal_ocr.backends import NullDetector
+
+    engine = TemporalOCREngine(
+        NullDetector(),
+        CallableRecognizer(lambda _tasks: [], name="fake"),
+    )
+
+    def seed_track(geometry_id: int, timestamp: float) -> Any:
+        image = np.zeros((48, 120), dtype=np.uint8)
+        return engine.content._new_track(
+            CanonicalObservation(
+                geometry_id=geometry_id,
+                frame_id=geometry_id,
+                timestamp=timestamp,
+                image=image,
+                signature=b"sig",
+                sharpness=0.9,
+                contrast=0.9,
+                completeness=0.9,
+                occlusion=0.0,
+            )
+        )
+
+    stale = seed_track(1, 0.0)
+    stale.typewriter_score = 1.0
+    stale.last_seen = 10.0
+    engine.content.finalize_geometry(1)
+
+    assert engine._content_runtime_signals() == (0.0, 0.0)
+
+    active = seed_track(2, 1.0)
+    active.typewriter_score = 0.8
+    active.last_seen = 3.0
+
+    assert engine._content_runtime_signals() == (2.0, 0.8)
 
 
 def test_idle_heartbeat_does_not_extend_stale_content_tracks() -> None:
@@ -260,6 +408,37 @@ def test_fast_detection_prevents_redundant_local_detection() -> None:
     assert TemporalOCREngine._uncovered_scopes((encompassing,), [line]) == ()
 
 
+def test_small_observation_inside_large_scope_does_not_skip_the_scope() -> None:
+    # A large LOCAL change scope may contain text the small observation never
+    # covered; containment of the observation by the scope is not evidence
+    # that the whole scope was already detected.
+    line = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=((10.0, 10.0), (110.0, 10.0), (110.0, 50.0), (10.0, 50.0)),
+        confidence=0.90,
+        tier=DetectionTier.FAST,
+    )
+    wrapped_dialogue_scope = ((0.0, 0.0), (400.0, 0.0), (400.0, 200.0), (0.0, 200.0))
+
+    assert TemporalOCREngine._uncovered_scopes((wrapped_dialogue_scope,), [line]) == (
+        wrapped_dialogue_scope,
+    )
+
+
+def test_line_covering_a_local_scope_still_skips_redundant_local_work() -> None:
+    line = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=((10.0, 10.0), (210.0, 10.0), (210.0, 50.0), (10.0, 50.0)),
+        confidence=0.90,
+        tier=DetectionTier.FAST,
+    )
+    small_scope = ((20.0, 12.0), (60.0, 12.0), (60.0, 48.0), (20.0, 48.0))
+
+    assert TemporalOCREngine._uncovered_scopes((small_scope,), [line]) == ()
+
+
 def test_tracked_geometry_can_cover_a_local_change_without_model_detection() -> None:
     engine = TemporalOCREngine(
         CallableDetector(lambda _frame, _request: [], name="fake-detector"),
@@ -329,3 +508,76 @@ def test_tracked_geometry_requests_refresh_when_pixels_overflow_the_box() -> Non
     assert overflow[0][1][0] > POLYGON[1][0]
     assert overflow[0][0][1] < POLYGON[0][1]
     assert overflow[0][2][1] > POLYGON[2][1]
+
+
+def test_structurally_larger_scope_requests_geometry_refresh_without_pixel_overflow() -> None:
+    # A high-confidence single-line track inside a change scope that could
+    # hold several wrapped dialogue lines must refresh its geometry even when
+    # no changed pixels spill just outside the current box.
+    engine = TemporalOCREngine(
+        CallableDetector(lambda _frame, _request: [], name="fake-detector"),
+        CallableRecognizer(lambda _tasks: [], name="fake"),
+    )
+    seed = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=POLYGON,
+        confidence=0.9,
+        tier=DetectionTier.AUDIT,
+    )
+    engine.geometry.update([seed], frame_size=(640, 360))
+    wrapped_scope = ((0.0, 0.0), (400.0, 0.0), (400.0, 320.0), (0.0, 320.0))
+    request = DetectionRequest(
+        tier=DetectionTier.LOCAL,
+        reason="changed",
+        target_width=1600,
+        scopes=(wrapped_scope,),
+    )
+
+    projected, overflow, overflow_ids = engine._tracked_local_observations(
+        FramePacket(1, 1.0, np.zeros((360, 640, 3), dtype=np.uint8)),
+        request,
+        motion=MotionEstimate(np.eye(3), valid=True, confidence=0.9),
+        pixel_delta=np.zeros((360, 640), dtype=np.float32),
+    )
+
+    assert projected == []
+    assert len(overflow) == 1
+    assert overflow_ids == (1,)
+    assert overflow[0][0][1] < POLYGON[0][1]
+    assert overflow[0][2][1] > POLYGON[2][1]
+
+
+def test_ordinary_typewriter_line_is_not_refreshed_by_a_similar_scope() -> None:
+    # The normal guided path must stay detector-free: a scope comparable to
+    # the tracked line neither overflows nor is structurally much larger.
+    engine = TemporalOCREngine(
+        CallableDetector(lambda _frame, _request: [], name="fake-detector"),
+        CallableRecognizer(lambda _tasks: [], name="fake"),
+    )
+    seed = DetectionObservation(
+        frame_id=0,
+        timestamp=0.0,
+        polygon=POLYGON,
+        confidence=0.9,
+        tier=DetectionTier.AUDIT,
+    )
+    engine.geometry.update([seed], frame_size=(640, 360))
+    similar_scope = ((8.0, 8.0), (120.0, 8.0), (120.0, 60.0), (8.0, 60.0))
+    request = DetectionRequest(
+        tier=DetectionTier.LOCAL,
+        reason="changed",
+        target_width=1600,
+        scopes=(similar_scope,),
+    )
+
+    projected, overflow, overflow_ids = engine._tracked_local_observations(
+        FramePacket(1, 1.0, np.zeros((360, 640, 3), dtype=np.uint8)),
+        request,
+        motion=MotionEstimate(np.eye(3), valid=True, confidence=0.9),
+        pixel_delta=np.zeros((360, 640), dtype=np.float32),
+    )
+
+    assert len(projected) == 1
+    assert overflow == ()
+    assert overflow_ids == ()
