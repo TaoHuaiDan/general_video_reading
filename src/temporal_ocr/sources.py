@@ -19,6 +19,80 @@ class IterableFrameSource:
         return iter(self.frames)
 
 
+def frame_timestamp(
+    frame: Any,
+    *,
+    time_base: float | None,
+    average_rate: float,
+    decoded_frame_index: int,
+) -> float:
+    """Return the presentation timestamp of one decoded frame.
+
+    When the container provides no timing information, the fallback derives
+    the timestamp purely from the local decode position and the source frame
+    rate.  ``frame_id_offset`` is a chunk output namespace and must never
+    influence the time axis; the decode index advances for every decoded
+    frame (including sampled-out ones), so sampling cannot stall the clock.
+    """
+    if frame.time is not None:
+        return float(frame.time)
+    if frame.pts is not None and time_base:
+        return float(frame.pts * time_base)
+    return decoded_frame_index / max(average_rate, 1e-9)
+
+
+def iter_sampled_packets(
+    raw_frames: Iterable[Any],
+    *,
+    time_base: float | None,
+    average_rate: float,
+    sample_fps: float | None,
+    max_width: int | None,
+    start_sec: float | None,
+    end_sec: float | None,
+    frame_id_offset: int,
+) -> Iterator[FramePacket]:
+    """Turn decoded frames into sampled :class:`FramePacket` instances."""
+    next_sample_timestamp: float | None = None
+    emitted_frame_id = 0
+    decoded_frame_index = 0
+    for raw_frame in raw_frames:
+        timestamp = frame_timestamp(
+            raw_frame,
+            time_base=time_base,
+            average_rate=average_rate,
+            decoded_frame_index=decoded_frame_index,
+        )
+        decoded_frame_index += 1
+        if start_sec is not None and timestamp < start_sec:
+            continue
+        if end_sec is not None and timestamp > end_sec:
+            break
+        if sample_fps is not None:
+            interval = 1.0 / sample_fps
+            if (
+                next_sample_timestamp is not None
+                and timestamp + 1e-9 < next_sample_timestamp
+            ):
+                continue
+            next_sample_timestamp = timestamp + interval
+        image = raw_frame.to_ndarray(format="bgr24")
+        if max_width is not None and image.shape[1] > max_width:
+            scale = max_width / image.shape[1]
+            image = cv2.resize(
+                image,
+                (max_width, max(2, round(image.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        yield FramePacket(
+            frame_id=frame_id_offset + emitted_frame_id,
+            timestamp=timestamp,
+            image=image,
+            luma=cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+        )
+        emitted_frame_id += 1
+
+
 class PyAVFrameSource:
     def __init__(
         self,
@@ -94,41 +168,15 @@ class PyAVFrameSource:
                         )
                     except (AttributeError, ValueError):
                         pass
-            next_sample_timestamp: float | None = None
-            emitted_frame_id = 0
-            for raw_frame in container.decode(stream):
-                frame = cast(Any, raw_frame)
-                if frame.time is not None:
-                    timestamp = float(frame.time)
-                elif frame.pts is not None and stream.time_base is not None:
-                    timestamp = float(frame.pts * stream.time_base)
-                else:
-                    rate = float(stream.average_rate or 30.0)
-                    timestamp = (self.frame_id_offset + emitted_frame_id) / max(rate, 1e-9)
-                if self.start_sec is not None and timestamp < self.start_sec:
-                    continue
-                if self.end_sec is not None and timestamp > self.end_sec:
-                    break
-                if self.sample_fps is not None:
-                    interval = 1.0 / self.sample_fps
-                    if (
-                        next_sample_timestamp is not None
-                        and timestamp + 1e-9 < next_sample_timestamp
-                    ):
-                        continue
-                    next_sample_timestamp = timestamp + interval
-                image = frame.to_ndarray(format="bgr24")
-                if self.max_width is not None and image.shape[1] > self.max_width:
-                    scale = self.max_width / image.shape[1]
-                    image = cv2.resize(
-                        image,
-                        (self.max_width, max(2, round(image.shape[0] * scale))),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                yield FramePacket(
-                    frame_id=self.frame_id_offset + emitted_frame_id,
-                    timestamp=timestamp,
-                    image=image,
-                    luma=cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
-                )
-                emitted_frame_id += 1
+            average_rate = float(stream.average_rate or 0.0)
+            time_base = float(stream.time_base) if stream.time_base else None
+            yield from iter_sampled_packets(
+                container.decode(stream),
+                time_base=time_base,
+                average_rate=average_rate,
+                sample_fps=self.sample_fps,
+                max_width=self.max_width,
+                start_sec=self.start_sec,
+                end_sec=self.end_sec,
+                frame_id_offset=self.frame_id_offset,
+            )

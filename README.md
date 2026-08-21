@@ -18,7 +18,9 @@
 - 已有高置信度文字轨迹覆盖的 LOCAL 区域直接复用投影四边形，独立运动超过阈值时
   自动退回检测；周期性 AUDIT/FAST 仍负责发现新文字。
 - 基于运行时统计的规则式策略调度器。
-- Event Recall、Text Accuracy、Duplicate Rate、时空 IoU、吞吐和延迟指标。
+- Event Recall、Text Accuracy、Duplicate Rate、时空 IoU、吞吐和延迟指标。匹配只依赖
+  时空对应关系：文本识别错误计入 Text Accuracy（未匹配 reference 计为删除错误），
+  另有 matched_text_accuracy 与 event_precision 两个补充指标。
 - 可替换的视频源、检测器和 OCR 后端接口。
 
 架构细节见 [docs/architecture.md](docs/architecture.md)。

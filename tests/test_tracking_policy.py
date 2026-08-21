@@ -10,8 +10,10 @@ from temporal_ocr.selection import ComplementaryCandidateSelector
 from temporal_ocr.tracking import ContentTracker, GeometryTracker
 from temporal_ocr.types import (
     CanonicalObservation,
+    ContentState,
     DetectionObservation,
     DetectionTier,
+    OCRResult,
     PolicyDecision,
     RuntimeSignals,
 )
@@ -253,3 +255,56 @@ def test_policy_default_waits_match_legacy_baseline() -> None:
 
     assert decision.stable_wait_sec == 0.45
     assert decision.maximum_wait_sec == 1.8
+
+
+# Adjacent steps are ~0.09 apart (below the 0.16 default threshold) while the
+# cumulative drift from the first signature is far above it.
+_DRIFT_SIGNATURES = [
+    bytes([0b00000000] * 8),
+    bytes([0b00111111] + [0b00000000] * 7),
+    bytes([0b00111111, 0b00111111] + [0b00000000] * 6),
+    bytes([0b00111111, 0b00111111, 0b00111111] + [0b00000000] * 5),
+]
+
+
+def test_gradual_drift_below_threshold_reopens_recognition() -> None:
+    tracker = ContentTracker(ContentConfig())
+
+    first = tracker.update(canonical(7, 0.0, _DRIFT_SIGNATURES[0]))
+    track_id = first.active.content_id
+    second = tracker.update(canonical(7, 1.0, _DRIFT_SIGNATURES[0]))
+    assert second.ready_task is not None
+    tracker.mark_queued(track_id)
+    tracker.apply_result(
+        OCRResult(content_id=track_id, text="我们", confidence=0.9, backend="fake")
+    )
+
+    # Each later observation stays below the per-step change threshold, but
+    # the accumulated drift is large; the stale text must be released and
+    # recognition re-armed instead of keeping "我们" forever.
+    states = []
+    for index, timestamp in enumerate((2.0, 3.0, 4.0), start=1):
+        update = tracker.update(canonical(7, timestamp, _DRIFT_SIGNATURES[index]))
+        states.append(update)
+
+    final = states[-1]
+    assert final.active.recognized_text is None
+    assert final.ready_task is not None or final.active.state != ContentState.RECOGNIZED
+
+
+def test_stable_subtitle_does_not_rearm_or_rerecognize() -> None:
+    tracker = ContentTracker(ContentConfig())
+
+    tracker.update(canonical(7, 0.0, b"\x00" * 8))
+    update = tracker.update(canonical(7, 1.0, b"\x00" * 8))
+    assert update.ready_task is not None
+    tracker.mark_queued(update.active.content_id)
+    tracker.apply_result(
+        OCRResult(content_id=update.active.content_id, text="字幕", confidence=0.9)
+    )
+
+    for timestamp in (2.0, 3.0, 4.0, 5.0):
+        follow_up = tracker.update(canonical(7, timestamp, b"\x00" * 8))
+        assert follow_up.ready_task is None
+        assert follow_up.active.recognized_text == "字幕"
+        assert follow_up.active.state == ContentState.RECOGNIZED

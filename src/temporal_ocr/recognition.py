@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
+from typing import Any
+
+import numpy as np
 
 from temporal_ocr.backends import TextRecognizer
+from temporal_ocr.geometry import exact_signature
 from temporal_ocr.types import OCRResult, OCRTask
 
 # Entries hold only an OCR result keyed by a 32-byte digest, so a few thousand
@@ -15,12 +20,29 @@ from temporal_ocr.types import OCRResult, OCRTask
 DEFAULT_CACHE_MAX_ENTRIES = 4096
 
 
-class RecognitionCache:
-    """Exact normalized-image cache; perceptual reuse remains opt-in later.
+def candidate_set_signature(images: Sequence[Any]) -> bytes:
+    """Return an exact key for a task-level OCR result.
 
-    The cache is a bounded LRU when ``max_entries`` is given.  Passing
-    ``None`` restores unbounded retention for callers that manage memory
-    themselves.
+    The final OCR result of a task is a function of its complete candidate
+    set (primary crop plus fallbacks), not of the primary crop alone.  The
+    key therefore covers every candidate's exact pixel digest; two tasks that
+    share only the primary crop can never collide.
+    """
+    digests = sorted(exact_signature(np.asarray(image)) for image in images)
+    digest = hashlib.blake2b(digest_size=32)
+    digest.update(b"temporal-ocr/candidate-set/v1")
+    for item in digests:
+        digest.update(item)
+    return digest.digest()
+
+
+class RecognitionCache:
+    """Exact task-result cache; perceptual reuse remains opt-in later.
+
+    Keys are candidate-set digests (see :func:`candidate_set_signature`), so
+    a cached result is bound to the exact crop set that produced it.  The
+    cache is a bounded LRU when ``max_entries`` is given.  Passing ``None``
+    restores unbounded retention for callers that manage memory themselves.
     """
 
     def __init__(self, max_entries: int | None = DEFAULT_CACHE_MAX_ENTRIES) -> None:

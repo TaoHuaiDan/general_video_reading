@@ -60,17 +60,35 @@ def test_get_run_result_streams_bounded_event_preview(tmp_path, monkeypatch) -> 
         store.shutdown()
 
 
-def test_job_store_keeps_only_recent_finished_jobs(tmp_path) -> None:
-    store = _JobStore(output_root=tmp_path / "root", max_finished_jobs=2)
-    try:
-        job_ids = [
-            _submit_completed_run(store, tmp_path / f"run-{index}") for index in range(3)
-        ]
+def test_job_store_keeps_early_created_job_even_if_it_finishes_last(
+    tmp_path, monkeypatch
+) -> None:
+    import threading
 
-        assert len(store._jobs) == 2
-        assert job_ids[0] not in store._jobs
-        assert job_ids[1] in store._jobs
-        assert job_ids[2] in store._jobs
+    monkeypatch.setenv("TEMPORAL_OCR_MCP_WORKERS", "4")
+    store = _JobStore()
+    try:
+        release = threading.Event()
+
+        def slow_task():
+            release.wait(timeout=5)
+            return {"ok": True}
+
+        early = store.submit("test", tmp_path / "early", slow_task)
+        early_future = store.get(early["job_id"]).future
+        assert early_future is not None
+        for index in range(3):
+            quick = store.submit("test", tmp_path / f"quick-{index}", lambda: {"ok": True})
+            quick_future = store.get(quick["job_id"]).future
+            assert quick_future is not None
+            quick_future.result(timeout=2)
+
+        release.set()
+        early_future.result(timeout=5)
+
+        # The oldest-created job finished last; it must remain queryable.
+        assert store.get(early["job_id"]).status == "completed"
+        assert store.public(early["job_id"])["status"] == "completed"
     finally:
         store.shutdown()
 

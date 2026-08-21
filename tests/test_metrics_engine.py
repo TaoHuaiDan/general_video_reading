@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from temporal_ocr.backends import CallableDetector, CallableRecognizer
 from temporal_ocr.change import TileChangeDetector
@@ -66,6 +67,110 @@ def test_event_matching_maximizes_cardinality_before_quality() -> None:
 
     assert report.matched_events == 2
     assert report.event_recall == 1.0
+
+
+def test_matching_maximizes_total_score_among_maximum_cardinality_solutions() -> None:
+    # Both maximum-cardinality solutions exist; the score-greedy-but-feasible
+    # choice (R1-P1 + R2-P2) totals less than (R1-P2 + R2-P1).
+    from temporal_ocr.metrics import _minimum_cost_maximum_matching
+
+    chosen = _minimum_cost_maximum_matching(
+        [
+            (0, 0, 0.90),
+            (0, 1, 0.80),
+            (1, 0, 0.80),
+            (1, 1, 0.10),
+        ]
+    )
+
+    assert sorted(chosen) == [(0, 1), (1, 0)]
+
+
+def test_event_matching_prefers_higher_total_score_pairing() -> None:
+    def poly(left: float, right: float) -> tuple:
+        return ((left, 0.0), (right, 0.0), (right, 50.0), (left, 50.0))
+
+    def make(event_id: int, polygon: tuple) -> TextEvent:
+        return TextEvent(
+            event_id=event_id,
+            geometry_id=event_id,
+            content_id=event_id,
+            start=0.0,
+            end=10.0,
+            text_raw="hello",
+            text_normalized="hello",
+            confidence=0.9,
+            polygon_history=((0.0, polygon), (10.0, polygon)),
+            source_frame_ids=(1,),
+        )
+
+    reference = [make(1, poly(0.0, 100.0)), make(2, poly(0.0, 84.0))]
+    predicted = [make(3, poly(0.0, 95.0)), make(4, poly(15.0, 100.0))]
+
+    report = evaluate_events(reference, predicted)
+
+    assert report.matched_events == 2
+    assert report.event_recall == 1.0
+    # The optimal pairing (R1-P2, R2-P1) has clearly higher spatial quality
+    # than the score-greedy pairing (R1-P1, R2-P2).
+    assert report.mean_spatial_iou == pytest.approx(
+        (85.0 / 100.0 + 84.0 / 95.0) / 2.0,
+        abs=1e-3,
+    )
+
+
+def test_misrecognized_text_still_counts_as_a_detected_event() -> None:
+    # Perfect spatio-temporal alignment must count as detection even when OCR
+    # produced wrong text; the error belongs to Text Accuracy, not Recall.
+    reference = [event(1, "今天去学校。")]
+    predicted = [event(2, "完全不同的文字")]
+
+    report = evaluate_events(reference, predicted)
+
+    assert report.matched_events == 1
+    assert report.event_recall == 1.0
+    assert report.text_accuracy < 0.5
+
+
+def test_no_matches_reports_zero_accuracy_instead_of_perfect() -> None:
+    left = ((10.0, 10.0), (110.0, 10.0), (110.0, 50.0), (10.0, 50.0))
+    far_right = ((500.0, 300.0), (600.0, 300.0), (600.0, 340.0), (500.0, 340.0))
+
+    def timed(event_id: int, text: str, polygon: tuple, start: float) -> TextEvent:
+        return TextEvent(
+            event_id=event_id,
+            geometry_id=event_id,
+            content_id=event_id,
+            start=start,
+            end=start + 1.0,
+            text_raw=text,
+            text_normalized=text,
+            confidence=0.9,
+            polygon_history=((start, polygon),),
+            source_frame_ids=(1,),
+        )
+
+    reference = [timed(1, "甲事件文本", left, 0.0)]
+    predicted = [timed(2, "乙别处内容", far_right, 50.0)]
+
+    report = evaluate_events(reference, predicted)
+
+    assert report.matched_events == 0
+    assert report.event_recall == 0.0
+    assert report.text_accuracy == 0.0
+
+
+def test_report_includes_matched_text_accuracy_and_event_precision() -> None:
+    reference = [event(1, "今天去学校。")]
+    predicted = [event(2, "今天去学校。"), event(3, "今天去学校。")]
+
+    report = evaluate_events(reference, predicted)
+
+    assert report.matched_text_accuracy == 1.0
+    assert report.event_precision == pytest.approx(0.5)
+    payload = report.to_dict()
+    assert "matched_text_accuracy" in payload
+    assert "event_precision" in payload
 
 
 def test_event_metrics_cover_recall_accuracy_duplicates_and_throughput() -> None:

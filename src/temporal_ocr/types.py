@@ -138,6 +138,11 @@ class ContentTrack:
     last_seen: float
     last_changed: float
     latest_signature: bytes
+    # Signature baseline for accumulated sub-threshold drift.  It is set at
+    # track creation and refreshed whenever recognition is re-armed, so slow
+    # gradual changes (a slow typewriter) cannot hide behind the per-step
+    # change threshold forever.
+    anchor_signature: bytes = b""
     stable_observations: int = 0
     typewriter_score: float = 0.0
     candidates: list[CanonicalObservation] = field(default_factory=list)

@@ -18,7 +18,6 @@ from temporal_ocr.detection import HierarchicalDetectionPlanner
 from temporal_ocr.geometry import (
     candidate_quality,
     canonicalize_crop,
-    exact_signature,
     image_signature,
     normalized_region_polygon,
     polygon_area,
@@ -33,7 +32,12 @@ from temporal_ocr.geometry import (
 from temporal_ocr.motion import GlobalMotionEstimator, identity_motion
 from temporal_ocr.policy import RuleBasedPolicyScheduler
 from temporal_ocr.profiling import Profiler, RunProfile
-from temporal_ocr.recognition import OCRBatchQueue, RecognitionCache, recognize_tasks
+from temporal_ocr.recognition import (
+    OCRBatchQueue,
+    RecognitionCache,
+    candidate_set_signature,
+    recognize_tasks,
+)
 from temporal_ocr.tracking import ContentTracker, GeometryTracker
 from temporal_ocr.types import (
     CanonicalObservation,
@@ -87,7 +91,7 @@ class TemporalOCREngine:
         self.config = config or EngineConfig()
         self.detector = detector
         self.recognizer = recognizer
-        self.cache = cache or RecognitionCache()
+        self.cache = cache if cache is not None else RecognitionCache()
         self.exclude_regions = validate_normalized_regions(exclude_regions)
         self._reset_run_state()
 
@@ -490,10 +494,11 @@ class TemporalOCREngine:
             return
         if track.content_id in self._queued_content_ids:
             return
-        best = max(track.candidates, key=lambda item: item.quality)
-        # Exact reuse must key on the true crop content; the perceptual
-        # signature is only a change-detection hint and may collide.
-        cached = self.cache.get(self.recognizer.name, exact_signature(best.image))
+        # Exact reuse must key on the complete computation input: the final
+        # result can come from any fallback candidate, so the key covers the
+        # whole candidate set, not just the primary crop.
+        cache_key = candidate_set_signature([item.image for item in track.candidates])
+        cached = self.cache.get(self.recognizer.name, cache_key)
         if cached is not None:
             result = OCRResult(
                 content_id=track.content_id,
@@ -536,12 +541,12 @@ class TemporalOCREngine:
                 track = self.content.apply_result(result)
                 self._results[result.content_id] = result
                 task = task_by_id[result.content_id]
-                best = max(task.candidates, key=lambda item: item.quality)
                 self.cache.put(
                     self.recognizer.name,
-                    exact_signature(best.image),
+                    candidate_set_signature([item.image for item in task.candidates]),
                     result,
                 )
+                best = max(task.candidates, key=lambda item: item.quality)
                 track.last_seen = max(track.last_seen, best.timestamp)
 
     def _build_events(self) -> list[TextEvent]:

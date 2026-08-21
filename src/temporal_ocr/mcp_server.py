@@ -76,14 +76,15 @@ class _Job:
 
 
 class _JobStore:
-    """Small in-process job registry with one bounded OCR worker by default."""
+    """Small in-process job registry with one bounded OCR worker by default.
 
-    def __init__(
-        self,
-        *,
-        output_root: str | Path | None = None,
-        max_finished_jobs: int | None = None,
-    ) -> None:
+    Jobs are retained for the lifetime of the server process: a job that
+    finishes must remain queryable and cleanable regardless of when it was
+    created or how many later jobs already completed (artifacts retention is
+    a separate, explicit concern handled by ``cleanup_run``).
+    """
+
+    def __init__(self, *, output_root: str | Path | None = None) -> None:
         if output_root is not None:
             self.output_root = Path(output_root).expanduser().resolve()
         else:
@@ -96,26 +97,8 @@ class _JobStore:
         self.output_root.mkdir(parents=True, exist_ok=True)
         configured_workers = int(os.environ.get("TEMPORAL_OCR_MCP_WORKERS", "1"))
         self._executor = ThreadPoolExecutor(max_workers=max(1, min(configured_workers, 4)))
-        if max_finished_jobs is None:
-            max_finished_jobs = int(os.environ.get("TEMPORAL_OCR_MCP_MAX_JOBS", "100"))
-        if max_finished_jobs < 1:
-            raise ValueError("max_finished_jobs must be positive")
-        # Finished jobs only carry a small result payload, but an MCP server
-        # process can serve many runs; retain the most recent ones.
-        self._max_finished_jobs = max_finished_jobs
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
-
-    def _prune_finished_locked(self) -> None:
-        finished = [
-            job for job in self._jobs.values() if job.status in {"completed", "failed"}
-        ]
-        overflow = len(finished) - self._max_finished_jobs
-        if overflow <= 0:
-            return
-        finished.sort(key=lambda item: item.created_at)
-        for job in finished[:overflow]:
-            del self._jobs[job.job_id]
 
     def allocate_output_dir(self, requested: str | None, job_id: str) -> Path:
         target = Path(requested).expanduser().resolve() if requested else self.output_root / job_id
@@ -148,7 +131,6 @@ class _JobStore:
         )
         with self._lock:
             self._jobs[job_id] = job
-            self._prune_finished_locked()
         future = self._executor.submit(self._run, job_id, task)
         with self._lock:
             job.future = future
@@ -166,13 +148,11 @@ class _JobStore:
                 job.status = "failed"
                 job.finished_at = _utc_now()
                 job.error = f"{type(exc).__name__}: {exc}"
-                self._prune_finished_locked()
             return
         with self._lock:
             job.status = "completed"
             job.finished_at = _utc_now()
             job.result = result
-            self._prune_finished_locked()
 
     def forget(self, job_id: str) -> None:
         """Drop one job from the registry, e.g. after its cleanup."""

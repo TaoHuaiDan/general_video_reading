@@ -121,3 +121,64 @@ def test_merge_still_removes_true_overlap_boundary_duplicate() -> None:
     assert len(merged) == 1
     assert merged[0]["start"] == 118.0
     assert merged[0]["end"] == 124.0
+
+
+def test_merged_composite_keeps_full_chunk_provenance() -> None:
+    merged, _duplicate_count = merge_chunk_events(
+        [
+            _event(chunk_index=0, start=118.0, end=123.0, text="继续前进"),
+            _event(chunk_index=1, start=119.5, end=124.0, text="继续前进", confidence=0.95),
+        ],
+        overlap_sec=4.0,
+        start_sec=0.0,
+        end_sec=240.0,
+    )
+
+    assert merged[0]["_source_chunks"] == {0, 1}
+
+
+def test_composite_event_does_not_swallow_later_event_from_same_chunk() -> None:
+    first_pass, _count = merge_chunk_events(
+        [
+            _event(chunk_index=0, start=118.0, end=123.0, text="继续前进"),
+            _event(chunk_index=1, start=119.5, end=124.0, text="继续前进", confidence=0.95),
+        ],
+        overlap_sec=4.0,
+        start_sec=0.0,
+        end_sec=240.0,
+    )
+    assert len(first_pass) == 1
+
+    # A later event originating from chunk 1 shares provenance with the
+    # composite; it must not be treated as a cross-chunk duplicate of it.
+    late = _event(chunk_index=1, start=120.0, end=124.5, text="继续前进", confidence=0.97)
+    second_pass, duplicate_count = merge_chunk_events(
+        [*first_pass, late],
+        overlap_sec=4.0,
+        start_sec=0.0,
+        end_sec=240.0,
+    )
+
+    assert duplicate_count == 0
+    assert len(second_pass) == 2
+
+
+def test_internal_provenance_is_not_written_to_artifacts(tmp_path) -> None:
+    from temporal_ocr.chunking import _write_events
+
+    events = [
+        {
+            "event_id": 1,
+            "start": 0.0,
+            "end": 1.0,
+            "_chunk_index": 3,
+            "_source_chunks": {2, 3},
+            "text_normalized": "text",
+        }
+    ]
+
+    path = _write_events(tmp_path / "events.jsonl", events)
+    content = path.read_text(encoding="utf-8")
+
+    assert "_chunk_index" not in content
+    assert "_source_chunks" not in content

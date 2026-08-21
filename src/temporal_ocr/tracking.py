@@ -169,6 +169,7 @@ class ContentTracker:
             last_seen=observation.timestamp,
             last_changed=observation.timestamp,
             latest_signature=observation.signature,
+            anchor_signature=observation.signature,
             stable_observations=1,
             candidates=[observation],
         )
@@ -196,6 +197,25 @@ class ContentTracker:
         track.latest_signature = observation.signature
         track.stable_observations += 1
         track.candidates = self.selector.select(track.candidates, observation)
+        # A difference below the threshold is not "no change": slow typewriter
+        # text can drift far from the appearance that was actually recognized.
+        # Once accumulated drift from the recognition anchor crosses the same
+        # threshold, re-arm recognition in place instead of keeping stale OCR
+        # output forever.  The reset is per drift-quantum, so it costs one
+        # bounded re-recognition per threshold of change, never one per frame,
+        # and it does not create extra TextEvents (the same track is reused).
+        drift = signature_distance(track.anchor_signature, observation.signature)
+        if (
+            drift >= self.config.change_threshold
+            and track.state
+            in {ContentState.STABLE, ContentState.QUEUED, ContentState.RECOGNIZED}
+        ):
+            track.state = ContentState.CHANGING
+            track.last_changed = observation.timestamp
+            track.stable_observations = 1
+            track.anchor_signature = observation.signature
+            track.recognized_text = None
+            track.confidence = 0.0
         elapsed_stable = observation.timestamp - track.last_changed
         ready = (
             track.state not in {ContentState.QUEUED, ContentState.RECOGNIZED}

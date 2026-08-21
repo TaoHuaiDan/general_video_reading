@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from temporal_ocr.backends import CallableRecognizer, NullDetector
+from temporal_ocr.backends import CallableRecognizer, NullDetector, NullRecognizer
 from temporal_ocr.config import EngineConfig
 from temporal_ocr.engine import TemporalOCREngine
 from temporal_ocr.geometry import exact_signature, image_signature
@@ -110,3 +110,159 @@ def test_recognition_cache_is_bounded_lru() -> None:
     for index in range(10):
         unbounded.put("a", bytes([index]), result(str(index)))
     assert len(unbounded) == 10
+
+
+def test_engine_keeps_explicitly_provided_empty_cache() -> None:
+    custom = RecognitionCache(max_entries=None)
+
+    engine = TemporalOCREngine(NullDetector(), NullRecognizer(), cache=custom)
+
+    assert engine.cache is custom
+
+
+_SCRIPTED_OCR = {
+    100: ("8", 0.60),
+    150: ("5", 0.70),
+    200: ("3", 0.96),
+}
+
+
+def _scripted_recognizer(call_log: list[list[int]]) -> CallableRecognizer:
+    """Mimic the RapidOCR fallback: final text = highest OCR confidence."""
+
+    def recognize(tasks):
+        call_log.append([len(task.candidates) for task in tasks])
+        results: list[OCRResult] = []
+        for task in tasks:
+            best_text, best_score = "", -1.0
+            for candidate in task.candidates:
+                text, score = _SCRIPTED_OCR[int(float(np.mean(candidate.image)))]
+                if score > best_score:
+                    best_text, best_score = text, score
+            results.append(
+                OCRResult(
+                    content_id=task.content_id,
+                    text=best_text,
+                    confidence=best_score,
+                    backend="fake",
+                )
+            )
+        return results
+
+    return CallableRecognizer(recognize, name="fake")
+
+
+def _candidate(
+    geometry_id: int,
+    timestamp: float,
+    value: int,
+    quality: float,
+) -> CanonicalObservation:
+    image = np.full((48, 120), value, dtype=np.uint8)
+    return CanonicalObservation(
+        geometry_id=geometry_id,
+        frame_id=int(timestamp * 10),
+        timestamp=timestamp,
+        image=image,
+        # Uniform crops share one perceptual signature, so appending a
+        # fallback candidate keeps the same content track.
+        signature=image_signature(image),
+        sharpness=quality,
+        contrast=quality,
+        completeness=quality,
+        occlusion=0.0,
+    )
+
+
+def _run_task(engine: TemporalOCREngine, candidates: list[CanonicalObservation]) -> None:
+    profiler = Profiler()
+    track = engine.content._new_track(candidates[0])
+    for extra in candidates[1:]:
+        engine.content.update(extra)
+    engine._enqueue_content(track, profiler)
+    engine._flush_ocr(16, profiler, flush_all=True)
+
+
+def track_was_cached(engine: TemporalOCREngine, content_id: int) -> bool:
+    return content_id in engine._cached_content_ids
+
+
+def test_fallback_winning_candidate_does_not_pollute_primary_exact_key() -> None:
+    call_log: list[list[int]] = []
+    engine = TemporalOCREngine(
+        NullDetector(),
+        _scripted_recognizer(call_log),
+        config=EngineConfig(),
+    )
+
+    # Primary A has the best quality but weak OCR; fallback B wins.
+    _run_task(
+        engine,
+        [
+            _candidate(1, 0.0, 100, quality=0.9),
+            _candidate(1, 1.0, 200, quality=0.5),
+        ],
+    )
+    assert engine.content.tracks[1].recognized_text == "3"
+
+    # A second task whose primary is the exact same crop A, but without the
+    # fallback, must not inherit B's result through the cache.
+    _run_task(engine, [_candidate(2, 2.0, 100, quality=0.9)])
+
+    assert engine.content.tracks[2].recognized_text == "8"
+
+
+def test_identical_candidate_set_is_reused_exactly() -> None:
+    call_log: list[list[int]] = []
+    engine = TemporalOCREngine(
+        NullDetector(),
+        _scripted_recognizer(call_log),
+        config=EngineConfig(),
+    )
+
+    _run_task(
+        engine,
+        [
+            _candidate(1, 0.0, 100, quality=0.9),
+            _candidate(1, 1.0, 200, quality=0.5),
+        ],
+    )
+    _run_task(
+        engine,
+        [
+            _candidate(2, 2.0, 100, quality=0.9),
+            _candidate(2, 3.0, 200, quality=0.5),
+        ],
+    )
+
+    assert engine.content.tracks[2].recognized_text == "3"
+    assert track_was_cached(engine, 2)
+
+
+def test_different_fallback_set_gets_fresh_comparison() -> None:
+    call_log: list[list[int]] = []
+    engine = TemporalOCREngine(
+        NullDetector(),
+        _scripted_recognizer(call_log),
+        config=EngineConfig(),
+    )
+
+    _run_task(
+        engine,
+        [
+            _candidate(1, 0.0, 100, quality=0.9),
+            _candidate(1, 1.0, 200, quality=0.5),
+        ],
+    )
+    assert engine.content.tracks[1].recognized_text == "3"
+
+    # Same primary A, different fallback C: the comparison must run again.
+    _run_task(
+        engine,
+        [
+            _candidate(2, 2.0, 100, quality=0.9),
+            _candidate(2, 3.0, 150, quality=0.5),
+        ],
+    )
+
+    assert engine.content.tracks[2].recognized_text == "5"

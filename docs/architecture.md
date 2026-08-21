@@ -131,6 +131,13 @@ Every benchmark run records:
 - Per-stage time and detector/OCR request counts.
 - Policy changes and their reasons.
 
+Matching is spatio-temporal only: a prediction that localizes a reference in
+time and space counts as detection even when its OCR text is wrong; that
+error is reported by Text Accuracy (unmatched reference text counts as
+deletion errors, so zero detections can never score a perfect accuracy).
+Matched-only quality (`matched_text_accuracy`) and `event_precision`
+(matched predictions over all predictions) are recorded alongside.
+
 Configuration ranking is completeness-first. A faster configuration is rejected when it reduces
 event recall or text accuracy beyond the benchmark acceptance gate.
 

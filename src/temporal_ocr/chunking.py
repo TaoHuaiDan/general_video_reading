@@ -153,6 +153,7 @@ def _read_events(path: Path, *, chunk_index: int) -> list[dict[str, Any]]:
                 chunk_index * _FRAME_ID_CHUNK_STRIDE
             )
             event["_chunk_index"] = chunk_index
+            event["_source_chunks"] = {chunk_index}
             events.append(event)
     return events
 
@@ -198,13 +199,27 @@ def _is_prefix(left: str, right: str) -> bool:
     return bool(left and right) and (left.startswith(right) or right.startswith(left))
 
 
+def _event_sources(event: dict[str, Any]) -> set[int]:
+    """Return the set of source chunks an event was observed in."""
+    sources = event.get("_source_chunks")
+    if isinstance(sources, set):
+        return set(sources)
+    if "_chunk_index" in event:
+        return {int(event["_chunk_index"])}
+    return set()
+
+
 def _should_merge(
     left: dict[str, Any],
     right: dict[str, Any],
     *,
     overlap_sec: float,
 ) -> bool:
-    if left.get("_chunk_index") == right.get("_chunk_index"):
+    # Merging is only for cross-chunk boundary duplicates.  Shared source
+    # chunks mean the two events were already merged (or never split); a
+    # composite must not swallow a later event from a chunk it already
+    # contains.
+    if _event_sources(left) & _event_sources(right):
         return False
     left_start = float(left.get("start", 0.0))
     left_end = float(left.get("end", left_start))
@@ -297,6 +312,9 @@ def _merge_pair(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     merged["_chunk_index"] = min(
         int(left.get("_chunk_index", 0)), int(right.get("_chunk_index", 0))
     )
+    # Preserve complete provenance: a composite observed in chunks {0, 1}
+    # must not later masquerade as a chunk-0-only event.
+    merged["_source_chunks"] = _event_sources(left) | _event_sources(right)
     return merged
 
 

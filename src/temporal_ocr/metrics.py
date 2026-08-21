@@ -88,6 +88,10 @@ class EvaluationReport:
     latency_p50_sec: float | None = None
     latency_p95_sec: float | None = None
     latency_p99_sec: float | None = None
+    # OCR quality restricted to matched events; decoupled from detection.
+    matched_text_accuracy: float = 0.0
+    # Fraction of predictions that correspond to a reference event.
+    event_precision: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,35 +105,86 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return float(ordered[index])
 
 
-def _max_matching_size(pairs: list[tuple[int, int]]) -> int:
-    """Return the maximum bipartite matching size via Kuhn's algorithm.
+def _minimum_cost_maximum_matching(
+    edges: list[tuple[int, int, float]],
+) -> list[tuple[int, int]]:
+    """Return a maximum-cardinality matching with maximum total edge score.
 
-    The benchmark contract is completeness-first: greedy score-first pairing
-    cannot guarantee maximum cardinality and would under-report Event Recall
-    whenever two references compete for one high-scoring prediction.  Inputs
-    are tiny (events per run), so a small augmenting-path matcher is enough.
+    The benchmark contract is completeness-first, so the primary objective is
+    the number of matched reference/prediction pairs; total match quality is
+    only the second objective.  Greedy score-first pairing cannot guarantee
+    either.  This implements successive shortest augmenting paths
+    (Bellman-Ford) on a unit-capacity bipartite flow network with edge cost
+    ``-score``: after each augmentation the flow of that value has minimal
+    total cost, so the resulting maximum flow is score-optimal among all
+    maximum-cardinality matchings.  Benchmark graphs are tiny and the edge
+    insertion order makes tie-breaking deterministic.
     """
-    adjacency: dict[int, list[int]] = {}
-    for ref_index, pred_index in pairs:
-        adjacency.setdefault(ref_index, []).append(pred_index)
+    if not edges:
+        return []
+    refs = sorted({ref for ref, _pred, _score in edges})
+    preds = sorted({pred for _ref, pred, _score in edges})
+    source = 0
+    sink = len(refs) + len(preds) + 1
+    ref_node = {ref: index + 1 for index, ref in enumerate(refs)}
+    pred_node = {pred: len(refs) + 1 + index for index, pred in enumerate(preds)}
 
-    match_of_pred: dict[int, int] = {}
+    # Residual graph entries: [to, capacity, cost, reverse_index, payload].
+    # ``payload >= 0`` marks a real ref/pred edge so saturated edges can be
+    # recovered after the flow.
+    graph: list[list[list[Any]]] = [[] for _ in range(sink + 1)]
+    payloads: list[tuple[int, int]] = []
 
-    def try_assign(ref_index: int, visited: set[int]) -> bool:
-        for pred_index in adjacency.get(ref_index, ()):
-            if pred_index in visited:
-                continue
-            visited.add(pred_index)
-            if pred_index not in match_of_pred or try_assign(match_of_pred[pred_index], visited):
-                match_of_pred[pred_index] = ref_index
-                return True
-        return False
+    def add_edge(u: int, v: int, cost: float, payload: int = -1) -> None:
+        if payload >= 0:
+            payloads.append((ref_of_node[u], pred_of_node[v]))
+        graph[u].append([v, 1, cost, len(graph[v]), payload])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1, -1])
 
-    matched = 0
-    for ref_index in sorted(adjacency):
-        if try_assign(ref_index, set()):
-            matched += 1
-    return matched
+    ref_of_node = {node: ref for ref, node in ref_node.items()}
+    pred_of_node = {node: pred for pred, node in pred_node.items()}
+
+    for ref in refs:
+        add_edge(source, ref_node[ref], 0.0)
+    for pred in preds:
+        add_edge(pred_node[pred], sink, 0.0)
+    for ref, pred, score in sorted(edges, key=lambda item: (-item[2], item[0], item[1])):
+        add_edge(ref_node[ref], pred_node[pred], -float(score), payload=len(payloads))
+
+    infinity = float("inf")
+    while True:
+        distance = [infinity] * (sink + 1)
+        distance[source] = 0.0
+        path_to: list[tuple[int, int]] = [(-1, -1)] * (sink + 1)
+        for _ in range(sink + 1):
+            improved = False
+            for u in range(sink + 1):
+                if distance[u] == infinity:
+                    continue
+                for index, edge in enumerate(graph[u]):
+                    to, capacity, cost = edge[0], edge[1], edge[2]
+                    if capacity > 0 and distance[u] + cost < distance[to] - 1e-12:
+                        distance[to] = distance[u] + cost
+                        path_to[to] = (u, index)
+                        improved = True
+            if not improved:
+                break
+        if distance[sink] == infinity:
+            break
+        node = sink
+        while node != source:
+            u, index = path_to[node]
+            edge = graph[u][index]
+            edge[1] -= 1
+            graph[edge[0]][edge[3]][1] += 1
+            node = u
+
+    matched: list[tuple[int, int]] = []
+    for u in range(sink + 1):
+        for edge in graph[u]:
+            if edge[4] >= 0 and edge[1] == 0:
+                matched.append(payloads[edge[4]])
+    return sorted(set(matched))
 
 
 def evaluate_events(
@@ -143,6 +198,16 @@ def evaluate_events(
     min_temporal_iou: float = 0.10,
     min_spatial_iou: float = 0.05,
 ) -> EvaluationReport:
+    """Evaluate predictions against references, completeness-first.
+
+    Matching eligibility is spatio-temporal only: a prediction that localizes
+    a reference event in time and space counts as detection even when the OCR
+    text is wrong — that failure belongs to Text Accuracy.  Text similarity
+    still weights the combined match score used to choose among candidate
+    pairs (``min_text_similarity`` is kept for API compatibility but no
+    longer gates matching).  Unmatched reference characters count as
+    deletion errors so "no detections" can never masquerade as perfect text.
+    """
     pairs: list[tuple[float, int, int, float, float, float]] = []
     for ref_index, ref_event in enumerate(reference):
         for pred_index, pred_event in enumerate(predicted):
@@ -150,48 +215,48 @@ def evaluate_events(
             time_score = temporal_iou(ref_event, pred_event)
             space_score = mean_spatial_iou(ref_event, pred_event)
             if (
-                text_score >= min_text_similarity
-                and time_score >= min_temporal_iou
+                time_score >= min_temporal_iou
                 and space_score >= min_spatial_iou
             ):
                 score = 0.55 * text_score + 0.25 * time_score + 0.20 * space_score
                 pairs.append((score, ref_index, pred_index, text_score, time_score, space_score))
 
-    # First maximize the number of matched pairs, then pick higher-quality
-    # pairs among maximum-cardinality solutions.  A candidate is accepted
-    # only if the remaining graph can still reach the target cardinality.
-    target_matches = _max_matching_size(
-        [(ref_index, pred_index) for _s, ref_index, pred_index, *_ in pairs]
+    # Completeness-first matching: maximum cardinality first, then maximum
+    # total match quality among those solutions (deterministic).
+    pair_scores = {(ref_index, pred_index): (time_score, space_score)
+                   for _s, ref_index, pred_index, _t, time_score, space_score in pairs}
+    matched_pairs = _minimum_cost_maximum_matching(
+        [(ref_index, pred_index, score) for score, ref_index, pred_index, *_ in pairs]
     )
     matched_ref: set[int] = set()
     matched_pred: set[int] = set()
     matches: list[tuple[int, int, float, float]] = []
-    ordered_pairs = sorted(pairs, key=lambda item: (-item[0], item[1], item[2]))
-    for _score, ref_index, pred_index, _text, time_score, space_score in ordered_pairs:
-        if len(matches) >= target_matches:
-            break
-        if ref_index in matched_ref or pred_index in matched_pred:
-            continue
+    for ref_index, pred_index in matched_pairs:
+        time_score, space_score = pair_scores[(ref_index, pred_index)]
         matched_ref.add(ref_index)
         matched_pred.add(pred_index)
-        remaining = [
-            (candidate_ref, candidate_pred)
-            for _s, candidate_ref, candidate_pred, *_ in pairs
-            if candidate_ref not in matched_ref and candidate_pred not in matched_pred
-        ]
-        if len(matches) + 1 + _max_matching_size(remaining) < target_matches:
-            matched_ref.discard(ref_index)
-            matched_pred.discard(pred_index)
-            continue
         matches.append((ref_index, pred_index, time_score, space_score))
 
-    total_reference_chars = 0
-    total_character_errors = 0
+    total_reference_chars = sum(
+        max(len(normalize_for_metric(ref_event.text_normalized)), 1)
+        for ref_event in reference
+    )
+    matched_reference_chars = 0
+    matched_character_errors = 0
+    matched_ref_ids = {item[0] for item in matches}
     for ref_index, pred_index, _time_score, _space_score in matches:
         ref_text = normalize_for_metric(reference[ref_index].text_normalized)
         pred_text = normalize_for_metric(predicted[pred_index].text_normalized)
-        total_reference_chars += max(len(ref_text), 1)
-        total_character_errors += edit_distance(ref_text, pred_text)
+        matched_reference_chars += max(len(ref_text), 1)
+        matched_character_errors += edit_distance(ref_text, pred_text)
+    # Unmatched references are missed detections: their full text counts as
+    # deletion errors so Event Recall == 0 can never yield perfect accuracy.
+    unmatched_character_errors = sum(
+        max(len(normalize_for_metric(ref_event.text_normalized)), 1)
+        for ref_index, ref_event in enumerate(reference)
+        if ref_index not in matched_ref_ids
+    )
+    total_character_errors = matched_character_errors + unmatched_character_errors
 
     duplicate_predictions: set[int] = set()
     for _score, ref_index, pred_index, _text, _time, _space in pairs:
@@ -221,6 +286,12 @@ def evaluate_events(
         latency_p50_sec=_percentile(latencies, 0.50),
         latency_p95_sec=_percentile(latencies, 0.95),
         latency_p99_sec=_percentile(latencies, 0.99),
+        matched_text_accuracy=(
+            max(0.0, 1.0 - matched_character_errors / max(matched_reference_chars, 1))
+            if matches
+            else 0.0
+        ),
+        event_precision=len(matches) / max(len(predicted), 1),
     )
 
 
