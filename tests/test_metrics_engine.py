@@ -325,7 +325,11 @@ def test_fully_excluded_frame_has_well_defined_zero_statistics() -> None:
     assert result.scopes == ()
 
 
-def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> None:
+def test_replaced_intermediate_states_surface_but_final_state_still_flushes() -> None:
+    # With change_threshold near zero every frame is a content replacement.
+    # Replaced finalized states are complete texts whose geometry moved on,
+    # so they must reach OCR instead of being dropped by the typewriter
+    # defer; the final state still flushes at end-of-run.
     frames: list[FramePacket] = []
     for frame_id, timestamp in enumerate((0.0, 1.0, 2.0)):
         image = np.zeros((120, 220, 3), dtype=np.uint8)
@@ -361,8 +365,9 @@ def test_engine_defers_transient_typewriter_states_but_flushes_final_state() -> 
     )
     result = engine.run(frames)
 
-    assert result.profile.output_events <= 2
-    assert result.profile.counters.get("ocr_deferred_typewriter", 0.0) >= 1.0
+    assert result.profile.output_events == len(frames)
+    assert result.events[-1].end == 2.0
+    assert all(event.text_raw == "final" for event in result.events)
 
 
 def test_engine_run_does_not_mutate_caller_config_and_logs_max_wait() -> None:

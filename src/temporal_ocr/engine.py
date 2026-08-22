@@ -919,7 +919,12 @@ class TemporalOCREngine:
                     update = self.content.update(canonical)
                     profiler.profile.content_tracks_created += len(self.content.tracks) - before_count
                     if update.finalized is not None:
-                        self._enqueue_content(update.finalized, profiler)
+                        # This content is definitively over: its geometry
+                        # association moved to the replacement, so nothing will
+                        # re-enqueue it later. A typewriter defer here would
+                        # permanently drop a complete text (e.g. a replaced
+                        # burned-in subtitle line).
+                        self._enqueue_content(update.finalized, profiler, force=True)
                     if update.ready_task is not None:
                         self._enqueue_content(update.active, profiler)
             else:
