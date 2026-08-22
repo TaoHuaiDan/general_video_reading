@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Sequence
 from typing import Any
 
@@ -106,10 +106,14 @@ def recognize_tasks(
     if not tasks:
         return []
     results = recognizer.recognize_batch(tasks)
-    expected = {task.content_id for task in tasks}
-    actual = {result.content_id for result in results}
+    # Task identity is (content_id, revision): several revisions of one
+    # content track may legitimately share a batch.  Multiset comparison
+    # rejects missing, duplicated, extra and wrong-revision results.
+    expected = Counter((task.content_id, task.revision) for task in tasks)
+    actual = Counter((result.content_id, result.revision) for result in results)
     if expected != actual:
         raise RuntimeError(
-            f"recognizer returned mismatched content ids: expected={expected}, actual={actual}"
+            "recognizer returned mismatched task identities: "
+            f"expected={sorted(expected.items())}, actual={sorted(actual.items())}"
         )
     return results

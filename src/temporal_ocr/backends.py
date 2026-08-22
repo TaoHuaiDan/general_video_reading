@@ -30,6 +30,13 @@ class TextRecognizer(Protocol):
     def recognize_batch(self, tasks: Sequence[OCRTask]) -> list[OCRResult]: ...
 
 
+# Recognizer result contract: ``recognize_batch`` must return exactly one
+# OCRResult per task, echoing the task's ``content_id`` **and** ``revision``.
+# Task identity is (content_id, revision) and several revisions of one
+# content track may share a batch, so results are matched by that pair —
+# return order is irrelevant.  The engine rejects any missing, duplicated or
+# wrong-identity result at the validation boundary.
+#
 # Recognizers may additionally expose ``cache_namespace: str`` describing the
 # semantic configuration that influences recognition results (model/runtime,
 # fallback policy, ...).  The exact OCR cache uses it instead of ``name`` so
@@ -55,6 +62,13 @@ class CallableDetector:
 
 
 class CallableRecognizer:
+    """Adapter whose callback must honor the recognizer result contract.
+
+    Results are passed through unchanged, so the callback is responsible for
+    echoing each task's ``(content_id, revision)`` identity; violations are
+    rejected by ``recognize_tasks``.
+    """
+
     def __init__(
         self,
         callback: Callable[[Sequence[OCRTask]], list[OCRResult]],
@@ -91,6 +105,7 @@ class NullRecognizer:
                 text="",
                 confidence=0.0,
                 backend=self.name,
+                revision=task.revision,
             )
             for task in tasks
         ]

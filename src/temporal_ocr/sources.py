@@ -51,6 +51,36 @@ def frame_timestamp(
     return fallback_origin + decoded_frame_index / average_rate
 
 
+def iter_cadence_provable_decode(
+    decode: Any,
+    *,
+    decoder_skip_available: bool,
+) -> Iterator[Any]:
+    """Yield frames from a decode pass whose cadence the fallback can trust.
+
+    ``decode(with_decoder_skip)`` must return a fresh frame iterator.  The
+    timestamp fallback counts decoded frames, so it is only valid while the
+    iterator still follows the full source frame cadence.  When a
+    decoder-level skip (NONREF/BIDIR) is active but the first frame carries
+    no authoritative timestamp, that pass has already dropped media frames:
+    restart at full cadence instead of fabricating timestamps from a broken
+    ordinal.
+    """
+    raw_frames = decode(decoder_skip_available)
+    first = next(raw_frames, None)
+    if (
+        first is not None
+        and decoder_skip_available
+        and first.time is None
+        and first.pts is None
+    ):
+        raw_frames = decode(False)
+        first = next(raw_frames, None)
+    if first is not None:
+        yield first
+    yield from raw_frames
+
+
 def iter_sampled_packets(
     raw_frames: Iterable[Any],
     *,
@@ -155,18 +185,7 @@ class PyAVFrameSource:
                 stream.thread_type = self.thread_type
             except (AttributeError, ValueError):
                 pass
-            if self.start_sec is not None and self.start_sec > 0:
-                time_base = float(stream.time_base or 0.0)
-                if time_base > 0:
-                    # Seek to the nearest preceding keyframe. The exact start
-                    # boundary is still enforced below while decoding the
-                    # small keyframe pre-roll.
-                    container.seek(
-                        max(0, int(self.start_sec / time_base)),
-                        stream=stream,
-                        backward=True,
-                        any_frame=False,
-                    )
+            skip_mode: str | None = None
             if self.sample_fps is not None:
                 source_fps = float(stream.average_rate or 0.0)
                 if source_fps > self.sample_fps * 2.0:
@@ -174,36 +193,56 @@ class PyAVFrameSource:
                     # non-reference frame population. At low OCR sample rates,
                     # keeping reference frames retains timestamp coverage while
                     # avoiding most of the decode work before OCR.
-                    try:
-                        stream.codec_context.skip_frame = (
-                            "NONREF" if self.sample_fps <= 1.5 else "BIDIR"
-                        )
-                    except (AttributeError, ValueError):
-                        pass
+                    skip_mode = "NONREF" if self.sample_fps <= 1.5 else "BIDIR"
             average_rate = float(stream.average_rate or 0.0)
             time_base = float(stream.time_base) if stream.time_base else None
-            raw_frames = container.decode(stream)
-            fallback_origin = 0.0
-            if self.start_sec is not None and self.start_sec > 0:
-                # A keyframe seek lands at or before start_sec, and if frames
-                # carry no time/pts the fallback clock cannot be anchored to
-                # the media timeline afterwards.  Probe the first frame: with
-                # timing, anchor the fallback clock at its real timestamp;
-                # without, restart from the beginning so the fallback timeline
-                # stays provably correct (start_sec filtering still applies).
-                first = next(raw_frames, None)
-                if first is not None:
-                    if first.time is None and first.pts is None:
-                        container.seek(0, stream=stream, backward=True, any_frame=False)
-                        raw_frames = container.decode(stream)
-                    else:
-                        fallback_origin = frame_timestamp(
-                            first,
-                            time_base=time_base,
-                            average_rate=average_rate,
-                            decoded_frame_index=0,
+
+            def decode(with_decoder_skip: bool) -> Iterator[Any]:
+                if with_decoder_skip and skip_mode is not None:
+                    try:
+                        stream.codec_context.skip_frame = skip_mode
+                    except (AttributeError, ValueError):
+                        pass
+                if self.start_sec is not None and self.start_sec > 0:
+                    seek_time_base = float(stream.time_base or 0.0)
+                    if seek_time_base > 0:
+                        # Seek to the nearest preceding keyframe. The exact
+                        # start boundary is still enforced below while decoding
+                        # the small keyframe pre-roll.
+                        container.seek(
+                            max(0, int(self.start_sec / seek_time_base)),
+                            stream=stream,
+                            backward=True,
+                            any_frame=False,
                         )
+                return container.decode(stream)
+
+            raw_frames = iter_cadence_provable_decode(
+                decode,
+                decoder_skip_available=skip_mode is not None,
+            )
+            fallback_origin = 0.0
+            first = next(raw_frames, None)
+            if first is not None:
+                if first.time is None and first.pts is None:
+                    if self.start_sec is not None and self.start_sec > 0:
+                        # A keyframe seek lands at or before start_sec, and the
+                        # fallback clock cannot be anchored to the media
+                        # timeline without any timing. Restart from the
+                        # beginning so the fallback timeline stays provably
+                        # correct (start_sec filtering still applies).
+                        container.seek(0, stream=stream, backward=True, any_frame=False)
+                        raw_frames = itertools.chain(container.decode(stream), ())
+                    else:
                         raw_frames = itertools.chain([first], raw_frames)
+                else:
+                    fallback_origin = frame_timestamp(
+                        first,
+                        time_base=time_base,
+                        average_rate=average_rate,
+                        decoded_frame_index=0,
+                    )
+                    raw_frames = itertools.chain([first], raw_frames)
             yield from iter_sampled_packets(
                 raw_frames,
                 time_base=time_base,

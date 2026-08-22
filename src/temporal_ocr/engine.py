@@ -545,9 +545,11 @@ class TemporalOCREngine:
             with profiler.stage("ocr_inference"):
                 results = recognize_tasks(self.recognizer, tasks)
             profiler.profile.ocr_batches += 1
-            task_by_id = {task.content_id: task for task in tasks}
+            # Task identity is (content_id, revision): one batch may contain
+            # several revisions of the same content track.
+            task_by_identity = {(task.content_id, task.revision): task for task in tasks}
             for result in results:
-                task = task_by_id[result.content_id]
+                task = task_by_identity[(result.content_id, result.revision)]
                 # The cache is keyed by the exact crop set, so the entry stays
                 # valid for that input even if the task's revision went stale.
                 self.cache.put(

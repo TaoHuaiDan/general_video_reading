@@ -141,3 +141,64 @@ def test_missing_timing_and_unknown_rate_fails_instead_of_absurd_timeline() -> N
             decoded_frame_index=0,
             fallback_origin=0.0,
         )
+
+
+def test_decoder_skip_is_disabled_when_fallback_cadence_is_required() -> None:
+    # Media cadence is 30 fps; the decoder-level NONREF filter only hands
+    # frames 0, 3, 6, 9 downstream, and those frames carry no time/pts.
+    # The downstream ordinal 0,1,2,3 must never be interpreted as
+    # 0/30, 1/30, 2/30, 3/30: the decode pass must be restarted at full
+    # cadence so the fallback index counts every source frame.
+    from temporal_ocr.sources import iter_cadence_provable_decode
+
+    skipped_frames = [_FakeFrame() for _ in range(4)]
+    full_frames = [_FakeFrame() for _ in range(12)]
+    decode_calls: list[bool] = []
+
+    def decode(with_decoder_skip: bool):
+        decode_calls.append(with_decoder_skip)
+        return iter(list(skipped_frames if with_decoder_skip else full_frames))
+
+    output = list(
+        iter_cadence_provable_decode(decode, decoder_skip_available=True)
+    )
+
+    assert decode_calls == [True, False]
+    # The filtered 0/3/6/9 sequence never reaches the pipeline.
+    assert len(output) == 12
+
+
+def test_decoder_skip_is_kept_with_authoritative_timing() -> None:
+    from temporal_ocr.sources import iter_cadence_provable_decode
+
+    timed_frames = [_FakeFrame(time=float(index)) for index in range(4)]
+    decode_calls: list[bool] = []
+
+    def decode(with_decoder_skip: bool):
+        decode_calls.append(with_decoder_skip)
+        return iter(list(timed_frames))
+
+    output = list(
+        iter_cadence_provable_decode(decode, decoder_skip_available=True)
+    )
+
+    assert decode_calls == [True]
+    assert output is not None and len(output) == 4
+
+
+def test_full_cadence_decode_is_used_when_no_skip_is_available() -> None:
+    from temporal_ocr.sources import iter_cadence_provable_decode
+
+    frames = [_FakeFrame() for _ in range(5)]
+    decode_calls: list[bool] = []
+
+    def decode(with_decoder_skip: bool):
+        decode_calls.append(with_decoder_skip)
+        return iter(list(frames))
+
+    output = list(
+        iter_cadence_provable_decode(decode, decoder_skip_available=False)
+    )
+
+    assert decode_calls == [False]
+    assert len(output) == 5

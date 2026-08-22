@@ -173,6 +173,9 @@ class OCRResult:
     alternatives: tuple[str, ...] = ()
     backend: str = "unknown"
     inference_sec: float = 0.0
+    # Revision the originating OCRTask was created for; recognizers must echo
+    # it so (content_id, revision) identifies a result end to end.
+    revision: int = 0
 
 
 @dataclass(slots=True)

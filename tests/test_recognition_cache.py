@@ -369,6 +369,7 @@ def _scripted_text_recognizer(call_log: list[list[int]]) -> CallableRecognizer:
         return [
             OCRResult(
                 content_id=task.content_id,
+                revision=task.revision,
                 text="我们" if float(np.mean(task.candidates[0].image)) < 150 else "我们去学校",
                 confidence=0.95,
                 backend="fake",

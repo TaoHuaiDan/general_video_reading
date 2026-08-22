@@ -233,6 +233,7 @@ class RapidOCRBatchRecognizer:
                     alternatives=tuple(dict.fromkeys(other_texts)),
                     backend=self.name,
                     inference_sec=total_elapsed / max(len(tasks), 1),
+                    revision=task.revision,
                 )
             )
         return results
