@@ -516,6 +516,7 @@ class TemporalOCREngine:
                 alternatives=cached.alternatives,
                 backend=cached.backend,
                 inference_sec=0.0,
+                revision=track.revision,
             )
             self.content.apply_result(result)
             self._results[result.content_id] = result

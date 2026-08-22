@@ -228,3 +228,27 @@ def test_eof_flush_processes_current_revision_despite_stale_task() -> None:
 
     assert [event.text_raw for event in events] == ["B"]
     assert events[0].content_id == track.content_id
+
+
+def test_cache_hit_result_carries_current_revision() -> None:
+    # The re-armed revision observes the same pixels as revision 0 (only the
+    # perceptual signature drifted), so its task cache-hits. The rebuilt
+    # result must carry the current revision, not the default 0.
+    engine = _make_engine(_scripted_results_from_tasks)
+    profiler = Profiler()
+    anchor = image_signature(np.full((48, 120), 100, dtype=np.uint8))
+
+    track = engine.content._new_track(_obs(0.0, 100, anchor))
+    engine.content.update(_obs(1.0, 100, anchor))
+    engine._enqueue_content(track, profiler)
+    engine._flush_ocr(16, profiler, flush_all=True)
+    assert track.recognized_text == "A"
+
+    engine.content.update(_obs(2.0, 100, _drifted(anchor, 1)))
+    engine.content.update(_obs(3.0, 100, _drifted(anchor, 2)))
+    engine.content.update(_obs(4.0, 100, _drifted(anchor, 2)))
+    assert track.revision == 1
+    engine._enqueue_content(track, profiler)  # cache hit for the new revision
+
+    assert track.recognized_text == "A"
+    assert engine._results[track.content_id].revision == 1

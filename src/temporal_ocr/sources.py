@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import cv2
 
 from temporal_ocr.types import FramePacket
+
+
+@dataclass(frozen=True, slots=True)
+class DecodePassResult:
+    """A decode pass plus whether the ordinal timestamp fallback is provable."""
+
+    frames: Any
+    ordinal_fallback_allowed: bool
 
 
 class IterableFrameSource:
@@ -51,34 +60,45 @@ def frame_timestamp(
     return fallback_origin + decoded_frame_index / average_rate
 
 
-def iter_cadence_provable_decode(
+def resolve_decode_pass(
     decode: Any,
     *,
     decoder_skip_available: bool,
-) -> Iterator[Any]:
-    """Yield frames from a decode pass whose cadence the fallback can trust.
+    seek_to_start: bool,
+) -> Any:
+    """Pick a decode pass whose timeline the engine can prove.
 
-    ``decode(with_decoder_skip)`` must return a fresh frame iterator.  The
-    timestamp fallback counts decoded frames, so it is only valid while the
-    iterator still follows the full source frame cadence.  When a
-    decoder-level skip (NONREF/BIDIR) is active but the first frame carries
-    no authoritative timestamp, that pass has already dropped media frames:
-    restart at full cadence instead of fabricating timestamps from a broken
-    ordinal.
+    ``decode(with_decoder_skip, from_zero)`` must return a fresh frame
+    iterator starting at the requested origin.  The timestamp fallback counts
+    decoded frames, so it is only valid while the iterator follows the full
+    source frame cadence:
+
+    - A decoder-level skip (NONREF/BIDIR) drops media frames.  It may stay
+      active only while every output frame carries its own authoritative
+      time/pts (probed on the first frame); any later untimed frame then
+      fails loudly instead of using an untrustworthy ordinal.
+    - Without timing, neither a skipped stream nor a keyframe-seek origin is
+      provable: restart fresh at full cadence from the true media start.
     """
-    raw_frames = decode(decoder_skip_available)
-    first = next(raw_frames, None)
-    if (
-        first is not None
-        and decoder_skip_available
-        and first.time is None
-        and first.pts is None
-    ):
-        raw_frames = decode(False)
-        first = next(raw_frames, None)
-    if first is not None:
-        yield first
-    yield from raw_frames
+    frames = decode(with_decoder_skip=decoder_skip_available, from_zero=False)
+    first = next(frames, None)
+    if first is None:
+        return DecodePassResult(iter(()), ordinal_fallback_allowed=True)
+    timed = first.time is not None or first.pts is not None
+    if not timed and (decoder_skip_available or seek_to_start):
+        # Untimed frames under a decoder-level skip, or after an unanchored
+        # keyframe seek, cannot use the ordinal clock. Restart at full
+        # cadence from the provable media start.
+        return DecodePassResult(
+            decode(with_decoder_skip=False, from_zero=True),
+            ordinal_fallback_allowed=True,
+        )
+    if decoder_skip_available:
+        return DecodePassResult(
+            itertools.chain([first], frames),
+            ordinal_fallback_allowed=False,
+        )
+    return DecodePassResult(itertools.chain([first], frames), ordinal_fallback_allowed=True)
 
 
 def iter_sampled_packets(
@@ -92,12 +112,23 @@ def iter_sampled_packets(
     end_sec: float | None,
     frame_id_offset: int,
     fallback_origin: float = 0.0,
+    ordinal_fallback_allowed: bool = True,
 ) -> Iterator[FramePacket]:
     """Turn decoded frames into sampled :class:`FramePacket` instances."""
     next_sample_timestamp: float | None = None
     emitted_frame_id = 0
     decoded_frame_index = 0
     for raw_frame in raw_frames:
+        if (
+            not ordinal_fallback_allowed
+            and raw_frame.time is None
+            and raw_frame.pts is None
+        ):
+            raise ValueError(
+                "decoder-level frame skipping is active and a decoded frame"
+                " carries no time/pts: the timestamp fallback requires a"
+                " full-cadence decode"
+            )
         timestamp = frame_timestamp(
             raw_frame,
             time_base=time_base,
@@ -197,13 +228,17 @@ class PyAVFrameSource:
             average_rate = float(stream.average_rate or 0.0)
             time_base = float(stream.time_base) if stream.time_base else None
 
-            def decode(with_decoder_skip: bool) -> Iterator[Any]:
-                if with_decoder_skip and skip_mode is not None:
-                    try:
-                        stream.codec_context.skip_frame = skip_mode
-                    except (AttributeError, ValueError):
-                        pass
-                if self.start_sec is not None and self.start_sec > 0:
+            def decode(with_decoder_skip: bool, from_zero: bool) -> Iterator[Any]:
+                # Always assign the target mode: a restart pass must really
+                # clear a previously set NONREF/BIDIR, not keep filtering.
+                target = skip_mode if with_decoder_skip and skip_mode else "DEFAULT"
+                try:
+                    stream.codec_context.skip_frame = target
+                except (AttributeError, ValueError):
+                    pass
+                if from_zero:
+                    container.seek(0, stream=stream, backward=True, any_frame=False)
+                elif self.start_sec is not None and self.start_sec > 0:
                     seek_time_base = float(stream.time_base or 0.0)
                     if seek_time_base > 0:
                         # Seek to the nearest preceding keyframe. The exact
@@ -217,32 +252,23 @@ class PyAVFrameSource:
                         )
                 return container.decode(stream)
 
-            raw_frames = iter_cadence_provable_decode(
+            pass_result = resolve_decode_pass(
                 decode,
                 decoder_skip_available=skip_mode is not None,
+                seek_to_start=self.start_sec is not None and self.start_sec > 0,
             )
+            raw_frames = pass_result.frames
             fallback_origin = 0.0
             first = next(raw_frames, None)
+            if first is not None and (first.time is not None or first.pts is not None):
+                fallback_origin = frame_timestamp(
+                    first,
+                    time_base=time_base,
+                    average_rate=average_rate,
+                    decoded_frame_index=0,
+                )
             if first is not None:
-                if first.time is None and first.pts is None:
-                    if self.start_sec is not None and self.start_sec > 0:
-                        # A keyframe seek lands at or before start_sec, and the
-                        # fallback clock cannot be anchored to the media
-                        # timeline without any timing. Restart from the
-                        # beginning so the fallback timeline stays provably
-                        # correct (start_sec filtering still applies).
-                        container.seek(0, stream=stream, backward=True, any_frame=False)
-                        raw_frames = itertools.chain(container.decode(stream), ())
-                    else:
-                        raw_frames = itertools.chain([first], raw_frames)
-                else:
-                    fallback_origin = frame_timestamp(
-                        first,
-                        time_base=time_base,
-                        average_rate=average_rate,
-                        decoded_frame_index=0,
-                    )
-                    raw_frames = itertools.chain([first], raw_frames)
+                raw_frames = itertools.chain([first], raw_frames)
             yield from iter_sampled_packets(
                 raw_frames,
                 time_base=time_base,
@@ -253,4 +279,5 @@ class PyAVFrameSource:
                 end_sec=self.end_sec,
                 frame_id_offset=self.frame_id_offset,
                 fallback_origin=fallback_origin,
+                ordinal_fallback_allowed=pass_result.ordinal_fallback_allowed,
             )
