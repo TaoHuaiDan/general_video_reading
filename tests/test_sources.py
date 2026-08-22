@@ -82,3 +82,62 @@ def test_explicit_frame_time_and_pts_take_precedence() -> None:
     )
 
     assert [packet.timestamp for packet in packets] == [12.5, 10.0]
+
+
+def test_fallback_timeline_anchors_at_segment_origin() -> None:
+    # After a keyframe seek (chunk read_start_sec=120) the decode index starts
+    # at zero locally; the fallback must anchor at the segment origin instead
+    # of restarting the media timeline at t=0.
+    frames = [_FakeFrame() for _ in range(3)]
+
+    packets = list(
+        iter_sampled_packets(
+            frames,
+            time_base=None,
+            average_rate=30.0,
+            sample_fps=None,
+            max_width=None,
+            start_sec=120.0,
+            end_sec=None,
+            frame_id_offset=10_000_000,
+            fallback_origin=120.0,
+        )
+    )
+
+    assert packets[0].timestamp == 120.0
+    assert packets[1].timestamp == 120.0 + 1.0 / 30.0
+    assert packets[2].timestamp == 120.0 + 2.0 / 30.0
+    # The chunk namespace still only affects frame ids.
+    assert packets[0].frame_id == 10_000_000
+
+
+def test_frame_timestamp_fallback_uses_segment_origin() -> None:
+    from temporal_ocr.sources import frame_timestamp
+
+    frame = _FakeFrame()
+
+    assert (
+        frame_timestamp(
+            frame,
+            time_base=None,
+            average_rate=30.0,
+            decoded_frame_index=2,
+            fallback_origin=120.0,
+        )
+        == 120.0 + 2.0 / 30.0
+    )
+
+
+def test_missing_timing_and_unknown_rate_fails_instead_of_absurd_timeline() -> None:
+    import pytest
+
+    from temporal_ocr.sources import frame_timestamp
+
+    with pytest.raises(ValueError):
+        frame_timestamp(
+            _FakeFrame(),
+            time_base=None,
+            average_rate=0.0,
+            decoded_frame_index=0,
+            fallback_origin=0.0,
+        )

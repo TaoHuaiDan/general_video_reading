@@ -143,6 +143,10 @@ class ContentTrack:
     # gradual changes (a slow typewriter) cannot hide behind the per-step
     # change threshold forever.
     anchor_signature: bytes = b""
+    # Increments whenever recognition is re-armed to a new semantic content
+    # revision; queued OCR tasks carry the revision they were created for so
+    # stale in-flight results cannot overwrite newer content.
+    revision: int = 0
     stable_observations: int = 0
     typewriter_score: float = 0.0
     candidates: list[CanonicalObservation] = field(default_factory=list)
@@ -156,6 +160,9 @@ class OCRTask:
     geometry_id: int
     candidates: tuple[CanonicalObservation, ...]
     priority: int = 0
+    # Content revision the task was created for; results from an older
+    # revision are discarded instead of applied.
+    revision: int = 0
 
 
 @dataclass(slots=True)

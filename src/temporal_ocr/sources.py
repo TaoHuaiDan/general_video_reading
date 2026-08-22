@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -25,20 +26,29 @@ def frame_timestamp(
     time_base: float | None,
     average_rate: float,
     decoded_frame_index: int,
+    fallback_origin: float = 0.0,
 ) -> float:
     """Return the presentation timestamp of one decoded frame.
 
     When the container provides no timing information, the fallback derives
-    the timestamp purely from the local decode position and the source frame
-    rate.  ``frame_id_offset`` is a chunk output namespace and must never
-    influence the time axis; the decode index advances for every decoded
-    frame (including sampled-out ones), so sampling cannot stall the clock.
+    the timestamp from the segment's temporal origin plus the local decode
+    position and source frame rate.  ``frame_id_offset`` is a chunk output
+    namespace and must never influence the time axis; the decode index
+    advances for every decoded frame (including sampled-out ones), so
+    sampling cannot stall the clock.  Without any timing information and an
+    unknown frame rate there is no provable timeline, so this fails instead
+    of fabricating absurd timestamps.
     """
     if frame.time is not None:
         return float(frame.time)
     if frame.pts is not None and time_base:
         return float(frame.pts * time_base)
-    return decoded_frame_index / max(average_rate, 1e-9)
+    if average_rate <= 0:
+        raise ValueError(
+            "cannot derive frame timestamps: frame carries no time/pts and the"
+            " source frame rate is unknown"
+        )
+    return fallback_origin + decoded_frame_index / average_rate
 
 
 def iter_sampled_packets(
@@ -51,6 +61,7 @@ def iter_sampled_packets(
     start_sec: float | None,
     end_sec: float | None,
     frame_id_offset: int,
+    fallback_origin: float = 0.0,
 ) -> Iterator[FramePacket]:
     """Turn decoded frames into sampled :class:`FramePacket` instances."""
     next_sample_timestamp: float | None = None
@@ -62,6 +73,7 @@ def iter_sampled_packets(
             time_base=time_base,
             average_rate=average_rate,
             decoded_frame_index=decoded_frame_index,
+            fallback_origin=fallback_origin,
         )
         decoded_frame_index += 1
         if start_sec is not None and timestamp < start_sec:
@@ -170,8 +182,30 @@ class PyAVFrameSource:
                         pass
             average_rate = float(stream.average_rate or 0.0)
             time_base = float(stream.time_base) if stream.time_base else None
+            raw_frames = container.decode(stream)
+            fallback_origin = 0.0
+            if self.start_sec is not None and self.start_sec > 0:
+                # A keyframe seek lands at or before start_sec, and if frames
+                # carry no time/pts the fallback clock cannot be anchored to
+                # the media timeline afterwards.  Probe the first frame: with
+                # timing, anchor the fallback clock at its real timestamp;
+                # without, restart from the beginning so the fallback timeline
+                # stays provably correct (start_sec filtering still applies).
+                first = next(raw_frames, None)
+                if first is not None:
+                    if first.time is None and first.pts is None:
+                        container.seek(0, stream=stream, backward=True, any_frame=False)
+                        raw_frames = container.decode(stream)
+                    else:
+                        fallback_origin = frame_timestamp(
+                            first,
+                            time_base=time_base,
+                            average_rate=average_rate,
+                            decoded_frame_index=0,
+                        )
+                        raw_frames = itertools.chain([first], raw_frames)
             yield from iter_sampled_packets(
-                container.decode(stream),
+                raw_frames,
                 time_base=time_base,
                 average_rate=average_rate,
                 sample_fps=self.sample_fps,
@@ -179,4 +213,5 @@ class PyAVFrameSource:
                 start_sec=self.start_sec,
                 end_sec=self.end_sec,
                 frame_id_offset=self.frame_id_offset,
+                fallback_origin=fallback_origin,
             )

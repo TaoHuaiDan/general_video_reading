@@ -92,6 +92,12 @@ class TemporalOCREngine:
         self.detector = detector
         self.recognizer = recognizer
         self.cache = cache if cache is not None else RecognitionCache()
+        # Semantic namespace of the recognizer configuration; two recognizer
+        # configurations that could produce different results for the same
+        # crops must never share exact cache entries.
+        self._cache_namespace = (
+            getattr(self.recognizer, "cache_namespace", None) or self.recognizer.name
+        )
         self.exclude_regions = validate_normalized_regions(exclude_regions)
         self._reset_run_state()
 
@@ -115,7 +121,9 @@ class TemporalOCREngine:
         )
         self.ocr_queue = OCRBatchQueue()
         self._cached_content_ids: set[int] = set()
-        self._queued_content_ids: set[int] = set()
+        # content_id -> revision of the task currently queued for it, so a
+        # re-armed (newer) revision can enqueue while an old task is in flight.
+        self._queued_revisions: dict[int, int] = {}
         self._results: dict[int, OCRResult] = {}
         self._geometry_refresh_cooldown_until: dict[int, float] = {}
         self._geometry_refresh_last_refresh_at: dict[int, float] = {}
@@ -492,13 +500,14 @@ class TemporalOCREngine:
             # recognizing each one wastes a batch slot and creates noisy events.
             profiler.count("ocr_deferred_typewriter")
             return
-        if track.content_id in self._queued_content_ids:
+        if self._queued_revisions.get(track.content_id) == track.revision:
+            # A task for exactly this content revision is already queued.
             return
         # Exact reuse must key on the complete computation input: the final
         # result can come from any fallback candidate, so the key covers the
         # whole candidate set, not just the primary crop.
         cache_key = candidate_set_signature([item.image for item in track.candidates])
-        cached = self.cache.get(self.recognizer.name, cache_key)
+        cached = self.cache.get(self._cache_namespace, cache_key)
         if cached is not None:
             result = OCRResult(
                 content_id=track.content_id,
@@ -517,10 +526,11 @@ class TemporalOCREngine:
             content_id=track.content_id,
             geometry_id=track.geometry_id,
             candidates=tuple(track.candidates),
+            revision=track.revision,
         )
         self.content.mark_queued(track.content_id)
         self.ocr_queue.push(task)
-        self._queued_content_ids.add(track.content_id)
+        self._queued_revisions[track.content_id] = track.revision
         profiler.profile.ocr_tasks += 1
 
     def _flush_ocr(
@@ -537,15 +547,25 @@ class TemporalOCREngine:
             profiler.profile.ocr_batches += 1
             task_by_id = {task.content_id: task for task in tasks}
             for result in results:
-                self._queued_content_ids.discard(result.content_id)
-                track = self.content.apply_result(result)
-                self._results[result.content_id] = result
                 task = task_by_id[result.content_id]
+                # The cache is keyed by the exact crop set, so the entry stays
+                # valid for that input even if the task's revision went stale.
                 self.cache.put(
-                    self.recognizer.name,
+                    self._cache_namespace,
                     candidate_set_signature([item.image for item in task.candidates]),
                     result,
                 )
+                queued_revision = self._queued_revisions.get(result.content_id)
+                if queued_revision == task.revision:
+                    del self._queued_revisions[result.content_id]
+                track = self.content.tracks.get(result.content_id)
+                if track is None or track.revision != task.revision:
+                    # The content was re-armed to a newer revision while this
+                    # task was in flight; the stale text must not overwrite it.
+                    profiler.count("ocr_stale_results_discarded")
+                    continue
+                self.content.apply_result(result)
+                self._results[result.content_id] = result
                 best = max(task.candidates, key=lambda item: item.quality)
                 track.last_seen = max(track.last_seen, best.timestamp)
 
@@ -804,23 +824,25 @@ class TemporalOCREngine:
 
             if requests:
                 overflow_ids = set(overflow_geometry_ids)
-                for geometry_id in self.geometry.end_ids(tuple(overflow_ids)):
-                    finalized = self.content.finalize_geometry(geometry_id)
-                    if finalized is not None:
-                        if (
-                            geometry_id in overflow_ids
-                            and finalized.recognized_text is None
-                            and finalized.stable_observations
-                            < self.config.content.stable_observations
-                        ):
-                            profiler.count("ocr_deferred_geometry_refresh")
-                            continue
-                        self._enqueue_content(finalized, profiler, force=True)
                 geometry_update = self.geometry.update(
                     observations,
                     motion=motion,
                     frame_size=(image.shape[1], image.shape[0]),
                 )
+                # A refresh re-detects the geometry envelope; it does not prove
+                # the old text vanished.  Tracks the refresh re-detected keep
+                # their geometry/content identity, so the same line neither
+                # duplicates into a second event nor loses its lifecycle.  Only
+                # tracks with no matching detection are finalized now, and
+                # their best candidate must still reach OCR instead of being
+                # silently discarded.
+                reassociated = overflow_ids.intersection(geometry_update.assignments)
+                lost_refresh_ids = tuple(overflow_ids - reassociated)
+                for geometry_id in self.geometry.end_ids(lost_refresh_ids):
+                    finalized = self.content.finalize_geometry(geometry_id)
+                    if finalized is not None:
+                        profiler.count("local_refresh_lost_tracks")
+                        self._enqueue_content(finalized, profiler, force=True)
                 if overflow_ids and geometry_update.assignments:
                     for geometry_id, assigned in geometry_update.assignments.items():
                         assigned_in_refresh = any(

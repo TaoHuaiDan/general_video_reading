@@ -182,15 +182,54 @@ def _event_polygon(event: dict[str, Any]) -> Any | None:
         return None
 
 
+def _event_history(event: dict[str, Any]) -> list[tuple[float, Any]]:
+    history: list[tuple[float, Any]] = []
+    for item in event.get("polygon_history") or []:
+        try:
+            history.append((float(item[0]), as_polygon(item[1])))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return history
+
+
+def _polygon_at(history: list[tuple[float, Any]], timestamp: float) -> Any:
+    return min(history, key=lambda item: abs(item[0] - timestamp))[1]
+
+
 def _spatial_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
-    left_polygon = _event_polygon(left)
-    right_polygon = _event_polygon(right)
-    if left_polygon is None or right_polygon is None:
+    """Compare geometry at aligned timestamps inside the temporal overlap.
+
+    A boundary duplicate is the same underlying event observed by two chunks,
+    so each chunk's polygon history covers a different slice of the same
+    trajectory.  Comparing only the final polygons would reject fast-moving
+    text whose last known positions differ; aligning both histories on the
+    shared overlap interval compares like with like.
+    """
+    left_history = _event_history(left)
+    right_history = _event_history(right)
+    if not left_history or not right_history:
         return 0.0
-    try:
-        return polygon_iou(left_polygon, right_polygon)
-    except (TypeError, ValueError):
-        return 0.0
+    left_start = float(left.get("start", 0.0))
+    left_end = float(left.get("end", left_start))
+    right_start = float(right.get("start", 0.0))
+    right_end = float(right.get("end", right_start))
+    overlap_start = max(left_start, right_start)
+    overlap_end = min(left_end, right_end)
+    if overlap_end < overlap_start:
+        # Gate logic guarantees coexistence; fall back to final polygons.
+        return max(0.0, min(1.0, polygon_iou(left_history[-1][1], right_history[-1][1])))
+    timestamps = sorted(
+        {
+            timestamp
+            for timestamp, _ in (*left_history, *right_history)
+            if overlap_start - 1e-9 <= timestamp <= overlap_end + 1e-9
+        }
+    ) or [(overlap_start + overlap_end) / 2.0]
+    scores = [
+        polygon_iou(_polygon_at(left_history, t), _polygon_at(right_history, t))
+        for t in timestamps
+    ]
+    return max(0.0, min(1.0, sum(scores) / len(scores)))
 
 
 def _is_prefix(left: str, right: str) -> bool:

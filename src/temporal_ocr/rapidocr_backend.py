@@ -32,7 +32,13 @@ def _rapidocr_class() -> Any:
 class RapidOCRRuntime:
     """Shared model runtime so detector and recognizer load weights only once."""
 
+    _serial = 0
+
     def __init__(self, *, params: dict[str, Any] | None = None) -> None:
+        RapidOCRRuntime._serial += 1
+        # Stable per-process identity: two runtimes may host different model
+        # configurations, and recognition results are not guaranteed to match.
+        self.serial = RapidOCRRuntime._serial
         self.engine = _rapidocr_class()(params=params)
 
 
@@ -159,6 +165,13 @@ class RapidOCRBatchRecognizer:
         typings = importlib.import_module("rapidocr.ch_ppocr_rec.typings")
         self._input_type = typings.TextRecInput
         self.fallback_threshold = fallback_threshold
+        # Semantic fingerprint: model runtime plus the fallback policy that
+        # decides whether secondary candidates can change the final result.
+        # Performance-only knobs (thread counts) are deliberately excluded.
+        self.cache_namespace = (
+            f"{self.name}:runtime-{self.runtime.serial}"
+            f":fallback-threshold-{self.fallback_threshold}"
+        )
 
     def _recognize_images(self, images: list[np.ndarray]) -> tuple[list[str], list[float], float]:
         if not images:

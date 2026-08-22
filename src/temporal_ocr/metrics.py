@@ -204,9 +204,10 @@ def evaluate_events(
     a reference event in time and space counts as detection even when the OCR
     text is wrong — that failure belongs to Text Accuracy.  Text similarity
     still weights the combined match score used to choose among candidate
-    pairs (``min_text_similarity`` is kept for API compatibility but no
-    longer gates matching).  Unmatched reference characters count as
-    deletion errors so "no detections" can never masquerade as perfect text.
+    pairs.  ``min_text_similarity`` is a deprecated compatibility parameter:
+    it no longer gates matching and only survives so existing callers keep
+    working.  Unmatched reference characters count as deletion errors so
+    "no detections" can never masquerade as perfect text.
     """
     pairs: list[tuple[float, int, int, float, float, float]] = []
     for ref_index, ref_event in enumerate(reference):

@@ -25,14 +25,17 @@ def candidate_set_signature(images: Sequence[Any]) -> bytes:
 
     The final OCR result of a task is a function of its complete candidate
     set (primary crop plus fallbacks), not of the primary crop alone.  The
-    key therefore covers every candidate's exact pixel digest; two tasks that
-    share only the primary crop can never collide.
+    key covers every candidate's exact pixel digest **in candidate order**:
+    primary selection (``max`` by quality) and alternative ordering break
+    ties by list position, so the computation is not proven permutation
+    invariant and an ordered digest is the conservative exact key.
     """
-    digests = sorted(exact_signature(np.asarray(image)) for image in images)
+    images = list(images)
     digest = hashlib.blake2b(digest_size=32)
-    digest.update(b"temporal-ocr/candidate-set/v1")
-    for item in digests:
-        digest.update(item)
+    digest.update(b"temporal-ocr/candidate-set/v2")
+    digest.update(len(images).to_bytes(8, "big"))
+    for image in images:
+        digest.update(exact_signature(np.asarray(image)))
     return digest.digest()
 
 
@@ -61,6 +64,9 @@ class RecognitionCache:
     def put(self, backend: str, signature: bytes, result: OCRResult) -> None:
         key = (backend, signature)
         self._items[key] = result
+        # Assignment alone does not refresh OrderedDict recency; an updated
+        # entry must count as recently used or fresh updates get evicted.
+        self._items.move_to_end(key)
         if self._max_entries is not None:
             while len(self._items) > self._max_entries:
                 self._items.popitem(last=False)

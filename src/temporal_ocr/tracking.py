@@ -216,6 +216,11 @@ class ContentTracker:
             track.anchor_signature = observation.signature
             track.recognized_text = None
             track.confidence = 0.0
+            # New semantic content revision: the candidate pool must describe
+            # the new appearance only, otherwise an old high-quality partial
+            # crop keeps winning primary selection for the new revision.
+            track.candidates = [observation]
+            track.revision += 1
         elapsed_stable = observation.timestamp - track.last_changed
         ready = (
             track.state not in {ContentState.QUEUED, ContentState.RECOGNIZED}

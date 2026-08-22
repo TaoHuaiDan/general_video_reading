@@ -577,6 +577,78 @@ def test_tracked_geometry_can_cover_a_local_change_without_model_detection() -> 
     assert projected[0].tier == DetectionTier.LOCAL
 
 
+_REFRESH_BOX = ((10.0, 20.0), (70.0, 20.0), (70.0, 46.0), (10.0, 46.0))
+
+
+def _refresh_scene(*, far_block: bool = False, bands: bool = False) -> np.ndarray:
+    image = np.zeros((180, 320, 3), dtype=np.uint8)
+    image[20:46, 10:70] = 255
+    if far_block:
+        # Outside the guided overflow padding rings of the tracked line.
+        image[30:40, 95:115] = 255
+    if bands:
+        # Envelope-scale change above and below the line: the scope becomes
+        # structurally much larger than the tracked box.
+        image[0:18, 0:240] = 255
+        image[52:80, 0:240] = 255
+    return image
+
+
+def _detect_same_polygon(frame, request):
+    return [
+        DetectionObservation(
+            frame_id=frame.frame_id,
+            timestamp=frame.timestamp,
+            polygon=_REFRESH_BOX,
+            confidence=0.99,
+            tier=request.tier,
+        )
+    ]
+
+
+def _detect_audit_only(frame, request):
+    if request.tier == DetectionTier.AUDIT:
+        return _detect_same_polygon(frame, request)
+    return []
+
+
+def test_geometry_refresh_keeps_identity_when_text_is_redetected() -> None:
+    def recognize(tasks):
+        return [OCRResult(task.content_id, "text", 0.99, backend="fake") for task in tasks]
+
+    frames = [
+        FramePacket(0, 0.0, _refresh_scene()),
+        FramePacket(1, 0.5, _refresh_scene(far_block=True)),
+        FramePacket(2, 1.0, _refresh_scene(far_block=True, bands=True)),
+    ]
+    result = TemporalOCREngine(
+        CallableDetector(_detect_same_polygon, name="fake-detector"),
+        CallableRecognizer(recognize, name="fake"),
+    ).run(frames)
+
+    # The refresh re-detected the same line: it must not become a duplicate
+    # second event.
+    assert [event.text_raw for event in result.events] == ["text"]
+
+
+def test_geometry_refresh_still_ocrs_unstable_content_when_text_disappears() -> None:
+    def recognize(tasks):
+        return [OCRResult(task.content_id, "text", 0.99, backend="fake") for task in tasks]
+
+    frames = [
+        FramePacket(0, 0.0, _refresh_scene()),
+        FramePacket(1, 1.0, _refresh_scene(bands=True)),
+    ]
+    result = TemporalOCREngine(
+        CallableDetector(_detect_audit_only, name="fake-detector"),
+        CallableRecognizer(recognize, name="fake"),
+    ).run(frames)
+
+    # The refresh did not re-detect the line and the content was never
+    # stable; its best candidate must still be recognized, not dropped.
+    assert [event.text_raw for event in result.events] == ["text"]
+
+
 def test_tracked_geometry_requests_refresh_when_pixels_overflow_the_box() -> None:
     engine = TemporalOCREngine(
         CallableDetector(lambda _frame, _request: [], name="fake-detector"),

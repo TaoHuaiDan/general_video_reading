@@ -88,6 +88,40 @@ def test_cache_does_not_reuse_result_across_perceptually_identical_crops() -> No
     assert len(batch_sizes) == 2
 
 
+def test_candidate_set_signature_preserves_candidate_order() -> None:
+    from temporal_ocr.recognition import candidate_set_signature
+
+    low = np.full((48, 120), 100, dtype=np.uint8)
+    high = np.full((48, 120), 200, dtype=np.uint8)
+
+    # Primary selection (max-by-quality) breaks ties by list position, so the
+    # computation is order-sensitive and the key must be too.
+    assert candidate_set_signature([low, high]) != candidate_set_signature([high, low])
+    assert candidate_set_signature([low]) != candidate_set_signature([low, low])
+    assert candidate_set_signature([low, high]) == candidate_set_signature([low, high])
+
+
+def test_recognition_cache_put_refreshes_lru_recency() -> None:
+    cache = RecognitionCache(max_entries=2)
+
+    def result(value: str) -> OCRResult:
+        return OCRResult(content_id=1, text=value, confidence=1.0, backend="fake")
+
+    cache.put("a", b"1", result("one"))
+    cache.put("a", b"2", result("two"))
+    cache.put("a", b"1", result("one-updated"))
+
+    # Updating an existing key must count as recent use.
+    cache.put("a", b"3", result("three"))
+
+    assert len(cache) == 2
+    updated = cache.get("a", b"1")
+    assert updated is not None
+    assert updated.text == "one-updated"
+    assert cache.get("a", b"2") is None
+    assert cache.get("a", b"3") is not None
+
+
 def test_recognition_cache_is_bounded_lru() -> None:
     cache = RecognitionCache(max_entries=2)
 
@@ -118,6 +152,40 @@ def test_engine_keeps_explicitly_provided_empty_cache() -> None:
     engine = TemporalOCREngine(NullDetector(), NullRecognizer(), cache=custom)
 
     assert engine.cache is custom
+
+
+def test_recognizer_semantics_are_part_of_cache_namespace() -> None:
+    shared_cache = RecognitionCache(max_entries=None)
+
+    def make_recognizer(log: list[int], text: str):
+        def recognize(tasks):
+            log.append(len(tasks))
+            return [
+                OCRResult(content_id=task.content_id, text=text, confidence=0.9, backend="fake")
+                for task in tasks
+            ]
+
+        recognizer = CallableRecognizer(recognize, name="fake")
+        # Same name, different semantic configuration.
+        recognizer.cache_namespace = f"fake:fallback={text}"
+        return recognizer
+
+    log_low: list[int] = []
+    log_high: list[int] = []
+    strict = make_recognizer(log_low, "primary-wins")
+    loose = make_recognizer(log_high, "fallback-wins")
+    engine_strict = TemporalOCREngine(NullDetector(), strict, config=EngineConfig(), cache=shared_cache)
+    engine_loose = TemporalOCREngine(NullDetector(), loose, config=EngineConfig(), cache=shared_cache)
+
+    profiler = Profiler()
+    for engine in (engine_strict, engine_loose):
+        track = engine.content._new_track(_uniform_observation(1, 0.0, 100))
+        engine._enqueue_content(track, profiler)
+        engine._flush_ocr(16, profiler, flush_all=True)
+
+    assert len(log_low) == 1
+    assert len(log_high) == 1  # must not reuse the other configuration's entry
+    assert engine_loose.content.tracks[1].recognized_text == "fallback-wins"
 
 
 _SCRIPTED_OCR = {
@@ -266,3 +334,111 @@ def test_different_fallback_set_gets_fresh_comparison() -> None:
     )
 
     assert engine.content.tracks[2].recognized_text == "5"
+
+
+def _drifted(signature: bytes, steps: int) -> bytes:
+    # Each step flips 24 of the 256 signature bits (0.094, below the 0.16
+    # per-step threshold); two steps accumulate 0.1875 and cross it.
+    return bytes(b | 0xFF if index < 3 * steps else b for index, b in enumerate(signature))
+
+
+def _obs(
+    geometry_id: int,
+    timestamp: float,
+    value: int,
+    signature: bytes,
+    quality: float,
+) -> CanonicalObservation:
+    image = np.full((48, 120), value, dtype=np.uint8)
+    return CanonicalObservation(
+        geometry_id=geometry_id,
+        frame_id=int(timestamp * 10),
+        timestamp=timestamp,
+        image=image,
+        signature=signature,
+        sharpness=quality,
+        contrast=quality,
+        completeness=quality,
+        occlusion=0.0,
+    )
+
+
+def _scripted_text_recognizer(call_log: list[list[int]]) -> CallableRecognizer:
+    def recognize(tasks):
+        call_log.append([int(float(np.mean(c.image))) for t in tasks for c in t.candidates])
+        return [
+            OCRResult(
+                content_id=task.content_id,
+                text="我们" if float(np.mean(task.candidates[0].image)) < 150 else "我们去学校",
+                confidence=0.95,
+                backend="fake",
+            )
+            for task in tasks
+        ]
+
+    return CallableRecognizer(recognize, name="fake")
+
+
+def test_stale_queued_result_does_not_override_rearmed_content() -> None:
+    from temporal_ocr.profiling import Profiler as RunProfiler
+
+    call_log: list[list[int]] = []
+    engine = TemporalOCREngine(
+        NullDetector(),
+        _scripted_text_recognizer(call_log),
+        config=EngineConfig(),
+    )
+    profiler = RunProfiler()
+
+    anchor = image_signature(np.full((48, 120), 100, dtype=np.uint8))
+    track = engine.content._new_track(_obs(1, 0.0, 100, anchor, 0.9))
+    engine.content.update(_obs(1, 1.0, 100, anchor, 0.9))
+    engine._enqueue_content(track, profiler)
+    # T0 for revision 0 is queued but not flushed yet.
+    assert len(engine.ocr_queue) == 1
+
+    # Gradual drift below the per-step threshold, but crossing the anchor.
+    engine.content.update(_obs(1, 2.0, 200, _drifted(anchor, 1), 0.8))
+    engine.content.update(_obs(1, 3.0, 200, _drifted(anchor, 2), 0.8))
+    assert track.recognized_text is None  # re-armed to content B
+
+    # The stale revision-0 task flushes after the re-arm.
+    engine._flush_ocr(16, profiler, flush_all=True)
+    assert track.recognized_text is None
+
+    # B stabilizes and must be recognized with a fresh task.
+    engine.content.update(_obs(1, 4.0, 200, _drifted(anchor, 2), 0.8))
+    engine._enqueue_content(track, profiler)
+    engine._flush_ocr(16, profiler, flush_all=True)
+
+    assert track.recognized_text == "我们去学校"
+
+
+def test_rearm_switches_candidate_epoch_to_new_content() -> None:
+    from temporal_ocr.profiling import Profiler as RunProfiler
+
+    call_log: list[list[int]] = []
+    engine = TemporalOCREngine(
+        NullDetector(),
+        _scripted_text_recognizer(call_log),
+        config=EngineConfig(),
+    )
+    profiler = RunProfiler()
+
+    anchor = image_signature(np.full((48, 120), 100, dtype=np.uint8))
+    # High-quality partial crop A is recognized first.
+    track = engine.content._new_track(_obs(1, 0.0, 100, anchor, 0.95))
+    engine.content.update(_obs(1, 1.0, 100, anchor, 0.95))
+    engine._enqueue_content(track, profiler)
+    engine._flush_ocr(16, profiler, flush_all=True)
+    assert track.recognized_text == "我们"
+
+    # Lower-quality final crop B arrives through gradual drift.
+    engine.content.update(_obs(1, 2.0, 200, _drifted(anchor, 1), 0.8))
+    engine.content.update(_obs(1, 3.0, 200, _drifted(anchor, 2), 0.8))
+    engine._enqueue_content(track, profiler)
+    engine._flush_ocr(16, profiler, flush_all=True)
+
+    # The old high-quality crop must not be the primary of the new revision.
+    assert call_log[-1] == [200]
+    assert track.recognized_text == "我们去学校"

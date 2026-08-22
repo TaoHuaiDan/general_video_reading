@@ -30,6 +30,13 @@ class TextRecognizer(Protocol):
     def recognize_batch(self, tasks: Sequence[OCRTask]) -> list[OCRResult]: ...
 
 
+# Recognizers may additionally expose ``cache_namespace: str`` describing the
+# semantic configuration that influences recognition results (model/runtime,
+# fallback policy, ...).  The exact OCR cache uses it instead of ``name`` so
+# two configurations that could disagree on the same crops never share an
+# entry.  Performance-only settings such as thread counts must stay out.
+
+
 class CallableDetector:
     def __init__(
         self,
@@ -52,9 +59,11 @@ class CallableRecognizer:
         self,
         callback: Callable[[Sequence[OCRTask]], list[OCRResult]],
         name: str = "callable-recognizer",
+        cache_namespace: str | None = None,
     ) -> None:
         self.callback = callback
         self.name = name
+        self.cache_namespace = cache_namespace or name
 
     def recognize_batch(self, tasks: Sequence[OCRTask]) -> list[OCRResult]:
         return self.callback(tasks)
@@ -73,6 +82,7 @@ class NullDetector:
 
 class NullRecognizer:
     name = "null-recognizer"
+    cache_namespace = "null-recognizer"
 
     def recognize_batch(self, tasks: Sequence[OCRTask]) -> list[OCRResult]:
         return [
